@@ -64,7 +64,7 @@ def main():
         return
     audio = AudioSpec(rate=args.rate, channels=args.channels, ioBlockSamples=args.block)
     devices = DeviceConfig(micro=args.micro, headphones=args.headph)
-    checker = CheckerConfig(role=args.role, mode=args.mode, durationSec=args.duration, seed=args.seed, probeBlockSec=args.probe_block, probeLvlDbfs=args.probe_level, interface=args.iface)
+    checker = CheckerConfig(role=args.role, mode=getattr(args, "mode", "probe"), durationSec=args.duration, seed=args.seed, probeBlockSec=args.probe_block, probeLvlDbfs=args.probe_level, interface=args.iface)
 
 
     audio = AudioSpec(rate=args.rate, channels=args.channels, ioBlockSamples=args.block)
@@ -85,7 +85,7 @@ def main():
         ChannelMeasurementRunner(cfg).run()
         return
     
-    
+
     Runner(AppConfig(channel = args.channel, recordsDir=args.recdir, audio=audio, devices=devices, checker=checker)).run()
 
 if __name__ == "__main__":
