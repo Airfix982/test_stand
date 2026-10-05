@@ -12,7 +12,7 @@ class VirtualDevicesManager:
         return subprocess.run(args, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def checkPactl(self):
-        for tool in ["pactl", "parec", "pacat"]:
+        for tool in ["pactl", "parec", "pacat", "paplay"]:
             if not shutil.which(tool):
                 raise RuntimeError("NO TOOL: " + tool)
 
