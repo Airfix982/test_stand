@@ -68,7 +68,7 @@ def main():
 
 
     audio = AudioSpec(rate=args.rate, channels=args.channels, ioBlockSamples=args.block)
-    devices = DeviceConfig(micro=args.mic, headphones=args.headph)
+    devices = DeviceConfig(micro=args.micro, headphones=args.headph)
 
     if args.cmd == "measure":
         checker = CheckerConfig(
