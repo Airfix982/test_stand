@@ -3,3 +3,6 @@
 **/analysis_10m/
 **/analyze_test/
 **/records/
+
+**/analysis_*/
+*.wav
