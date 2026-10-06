@@ -30,11 +30,23 @@ def pactl(*args):
 
 
 def getDefaultSource():
-    return pactl("get-default-source")
+    info = pactl("info")
+
+    for line in info.splitlines():
+        if line.startswith("Default Source:"):
+            return line.split(":", 1)[1].strip()
+
+    raise RuntimeError("Default Source not found in pactl info")
 
 
 def getDefaultSink():
-    return pactl("get-default-sink")
+    info = pactl("info")
+
+    for line in info.splitlines():
+        if line.startswith("Default Sink:"):
+            return line.split(":", 1)[1].strip()
+
+    raise RuntimeError("Default Sink not found in pactl info")
 
 
 class RealtimeVirtualAudio:
