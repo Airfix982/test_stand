@@ -26,7 +26,7 @@ class SyncV1Config:
     acquireConfirm: int = 8
 
     # ±120 samples = ±7.5 ms.
-    trackRadius: int = 120
+    trackRadius: int = 48
 
     # При проверке train каждый следующий guard
     # может гулять только совсем немного.
@@ -713,6 +713,7 @@ class FixedGuardSyncV1:
 
         lo = max(
             self.buf.base,
+            self.lastGuard + self.cfg.frameSamples // 2 if self.lastGuard is not None else self.buf.base,
             self.buf.end - window
         )
 

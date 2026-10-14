@@ -169,6 +169,8 @@ class RealtimePlayout:
         self.firstFrame = None
         self.nextFrame = None
         self.startedAt = None
+        self.missingStart = None
+        self.missingCount = 0
 
         self.proc = subprocess.Popen(
             [
@@ -233,10 +235,22 @@ class RealtimePlayout:
             if frame is None:
                 frame = zero
 
-                self.log(
-                    "playout_missing",
-                    frame=nextFrame
-                )
+                if self.missingStart is None:
+                    self.missingStart = nextFrame
+
+                self.missingCount += 1
+            else:
+                if self.missingStart is not None:
+                    self.log(
+                        "playout_gap",
+                        start_frame=self.missingStart,
+                        end_frame=nextFrame - 1,
+                        frames=self.missingCount,
+                        duration_ms=self.missingCount * 20
+                    )
+
+                    self.missingStart = None
+                    self.missingCount = 0
 
             self.proc.stdin.write(
                 floatToPcm(frame)
@@ -379,6 +393,14 @@ def runTx(args):
             now = time.monotonic()
 
             if now >= nextStatus:
+                log(
+                    "tx_status",
+                    frame=frameIndex,
+                    phase=phase,
+                    rms=rms,
+                    pn_amp=guardAmp,
+                    clipped=clipped
+                )
                 print(
                     f"\rTX frame={frameIndex:7d} "
                     f"spin={phase} "
