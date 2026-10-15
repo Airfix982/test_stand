@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import firwin, lfilter
 
-from sync.v1 import makeGuardBank
+from sync.v2 import makeGuardBank
 
 
 def generate(

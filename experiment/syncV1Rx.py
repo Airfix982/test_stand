@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from sync.v1 import FixedGuardSyncV1, SyncV1Config
+from sync.v2 import FixedGuardSyncV1, SyncV1Config
 
 
 def floatToPcm(x):
