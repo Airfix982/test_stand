@@ -580,6 +580,13 @@ class FixedGuardSyncV1:
             hi
         )
 
+        expectedGuardPos = guardPos
+        expectedGuardError = (
+            None
+            if guardPos is None
+            else float(guardPos - expectedPos)
+        )
+
         expectedOk = (
             guardPos is not None
             and corr >= self.cfg.trackThreshold
@@ -620,7 +627,9 @@ class FixedGuardSyncV1:
                     expected_corr=corr,
                     expected_margin=margin,
                     best_corr=anyCorr,
-                    best_margin=anyMargin
+                    best_margin=anyMargin,
+                    expected_guard_pos=expectedGuardPos,
+                    expected_guard_error=expectedGuardError,
                 )
 
                 return True
@@ -642,7 +651,10 @@ class FixedGuardSyncV1:
                     observed_phase=anyPhase,
                     guard_pos=anyPos,
                     corr=anyCorr,
-                    observed_margin=anyMargin
+                    observed_margin=anyMargin,
+                    expected_guard_pos=expectedGuardPos,
+                    expected_guard_error=expectedGuardError,
+                    observed_guard_error=float(anyPos - expectedPos),
                 )
 
                 return True
