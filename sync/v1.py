@@ -569,47 +569,89 @@ class FixedGuardSyncV1:
             lo = expectedPos - self.cfg.trackRadius
             hi = expectedPos + self.cfg.trackRadius
 
-        guardPos, phase, corr = self._bestAnyGuard(
-            lo,
-            hi
-        )
-
+    
         expectedPhase = (
             frameIndex % self.cfg.spinnerSize
         )
 
-        if (
-            guardPos is None
-            or corr < self.cfg.trackThreshold
-        ):
-            self.state = "REACQUIRE"
-            self.stats["track_misses"] += 1
+        guardPos, corr, margin = self._bestExpectedGuard(
+            expectedPhase,
+            lo,
+            hi
+        )
 
-            self._event(
-                "track_miss",
-                expected_frame=frameIndex,
-                expected_guard=expectedPos,
-                best_corr=corr
-            )
+        expectedOk = (
+            guardPos is not None
+            and corr >= self.cfg.trackThreshold
+            and margin >= self.cfg.codeMargin
+        )
 
-            return True
 
-        if phase != expectedPhase:
-            self.state = "REACQUIRE"
+        if not expectedOk:
+            # Ожидаемый PN не подтверждн, чек есть ли убедительный другой spinner phase
+            anyPos, anyPhase, anyCorr = self._bestAnyGuard(lo, hi)
 
-            self.stats["track_misses"] += 1
-            self.stats["spinner_mismatches"] += 1
+            anyMargin = -1.0
 
-            self._event(
-                "spinner_mismatch",
-                expected_frame=frameIndex,
-                expected_phase=expectedPhase,
-                observed_phase=phase,
-                guard_pos=guardPos,
-                corr=corr
-            )
+            if (
+                anyPos is not None
+                and anyPhase is not None
+            ):
+                _, _, anyMargin = self._bestExpectedGuard(
+                    anyPhase,
+                    anyPos,
+                    anyPos
+                )
 
-            return True
+            # Вообще нет уверенного PN.
+            if (
+                anyPos is None
+                or anyCorr < self.cfg.trackThreshold
+                or anyMargin < self.cfg.codeMargin
+            ):
+                self.state = "REACQUIRE"
+                self.stats["track_misses"] += 1
+
+                self._event(
+                    "track_miss",
+                    expected_frame=frameIndex,
+                    expected_guard=expectedPos,
+                    expected_phase=expectedPhase,
+                    expected_corr=corr,
+                    expected_margin=margin,
+                    best_corr=anyCorr,
+                    best_margin=anyMargin
+                )
+
+                return True
+
+            # Есть уверенный PN, но это реально другой phase.
+            # Вот только теперь считаем это spinner mismatch.
+            if anyPhase != expectedPhase:
+                self.state = "REACQUIRE"
+
+                self.stats["track_misses"] += 1
+                self.stats["spinner_mismatches"] += 1
+
+                self._event(
+                    "spinner_mismatch",
+                    expected_frame=frameIndex,
+                    expected_phase=expectedPhase,
+                    expected_corr=corr,
+                    expected_margin=margin,
+                    observed_phase=anyPhase,
+                    guard_pos=anyPos,
+                    corr=anyCorr,
+                    observed_margin=anyMargin
+                )
+
+                return True
+
+            # Тот же ожидаемый phase нашёлся в другой точке
+            # окна с более надёжной разделимостью кодов.
+            guardPos = anyPos
+            corr = anyCorr
+            margin = anyMargin
 
         observedPeriod = (
             guardPos - self.lastGuard
