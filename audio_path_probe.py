@@ -222,9 +222,22 @@ def tx_worker(stop, physical_source, outdir, proof):
             y = x.copy()
 
             if proof:
+                # TX proof marker: a very obvious decaying two-tone "bell"
+                # every 2 seconds. This is inserted HERE, before TX_SINK/TX_MIC,
+                # so the remote side can hear it only if TX Python is in the path.
                 n = np.arange(BLOCK, dtype=np.int64) + sample_index
-                mask = (n % RATE) < int(0.120 * RATE)
-                y[mask] += 0.12 * np.sin(2.0 * np.pi * 880.0 * n[mask] / RATE)
+                phase_in_cycle = (n % (2 * RATE)).astype(np.float32) / RATE
+                active = phase_in_cycle < 0.55
+
+                t = phase_in_cycle
+                envelope = np.exp(-5.0 * t)
+                bell = (
+                    np.sin(2.0 * np.pi * 880.0 * t)
+                    + 0.55 * np.sin(2.0 * np.pi * 1320.0 * t)
+                    + 0.25 * np.sin(2.0 * np.pi * 1760.0 * t)
+                )
+
+                y[active] += 0.16 * envelope[active] * bell[active]
 
             y = np.clip(y, -0.999, 0.999)
 
@@ -252,7 +265,7 @@ def tx_worker(stop, physical_source, outdir, proof):
         dst.terminate()
 
 
-def rx_worker(stop, physical_sink, outdir):
+def rx_worker(stop, physical_sink, outdir, proof):
     src = subprocess.Popen(
         ["parec", f"--device={RX_SINK}.monitor", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"],
         stdout=subprocess.PIPE,
@@ -269,6 +282,7 @@ def rx_worker(stop, physical_sink, outdir):
 
     energy = 0.0
     count = 0
+    sample_index = 0
     next_print = time.monotonic() + 1.0
 
     try:
@@ -278,12 +292,30 @@ def rx_worker(stop, physical_sink, outdir):
                 break
 
             x = pcm_to_float(data)
+
+            # Save the signal exactly as it arrived from the virtual RX sink.
             w_in.write(x)
-            w_out.write(x)
-            dst.stdin.write(data)
+
+            y = x.copy()
+
+            if proof:
+                # RX proof marker: continuous 440 Hz tone added ONLY after
+                # rx_sink.monitor was read by Python and immediately before
+                # Python writes to the real physical speaker.
+                #
+                # Therefore hearing this continuous tone proves the RX Python
+                # worker is actually in the playback path.
+                n = np.arange(BLOCK, dtype=np.int64) + sample_index
+                y += 0.045 * np.sin(2.0 * np.pi * 440.0 * n / RATE)
+
+            y = np.clip(y, -0.999, 0.999)
+
+            w_out.write(y)
+            dst.stdin.write(float_to_pcm(y))
 
             energy += float(np.sum(x * x))
             count += len(x)
+            sample_index += len(x)
 
             if time.monotonic() >= next_print:
                 rms = (energy / max(count, 1)) ** 0.5
@@ -325,7 +357,7 @@ def run_tx(args):
         print("TX PATH ACTIVE")
         print(f"{physical_source} -> Python -> {TX_SINK} -> {TX_MIC} -> Chrome/Telemost")
         if args.proof:
-            print("PROOF ON: the remote computer should hear a 120 ms / 880 Hz beep once per second.")
+            print("TX PROOF ON: the remote computer should hear an obvious decaying two-tone bell about once every 2 seconds.")
         print("Press Ctrl+C to stop TX.")
 
         while worker.is_alive():
@@ -356,7 +388,7 @@ def run_rx(args):
         print("RX IS PAUSED HERE. No Python audio worker is running yet.")
         input("RX COMPUTER: join the Telemost call in Chrome, then press ENTER here: ")
 
-        worker = threading.Thread(target=rx_worker, args=(stop, physical_sink, args.out), daemon=True)
+        worker = threading.Thread(target=rx_worker, args=(stop, physical_sink, args.out, args.proof), daemon=True)
         worker.start()
         time.sleep(0.4)
 
@@ -364,6 +396,8 @@ def run_rx(args):
 
         print("RX PATH ACTIVE")
         print(f"Chrome/Telemost -> {RX_SINK} -> Python -> {physical_sink}")
+        if args.proof:
+            print("RX PROOF ON: you MUST hear a continuous 440 Hz tone from the real speaker/headphones while this RX Python worker is running.")
         print("Press Ctrl+C to stop RX.")
 
         while worker.is_alive():
