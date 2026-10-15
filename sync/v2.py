@@ -5,9 +5,12 @@ import numpy as np
 from scipy.signal import find_peaks, firwin
 
 
+# Optimized offline for lower pairwise cross-correlation after the
+# exact FIR band-pass + taper used below. Both TX and RX must use
+# the same bank.
 _GUARD_SEEDS = [
-    10227, 10139, 10918, 10636,
-    10820, 10345, 10578, 10889
+    30015, 34260, 34763, 30724,
+    33147, 32761, 31392, 34460
 ]
 
 
@@ -615,23 +618,32 @@ class FixedGuardSyncV1:
             )
         )
 
-        anyPos, anyPhase, anyCorr = self._bestAnyGuard(
-            lo,
-            hi
-        )
+        # Phase identity must be compared at ONE physical position.
+        # A speech codec can produce a strong false peak for another
+        # phase elsewhere inside ±trackRadius.
+        samePosPhase = None
+        samePosCorr = 0.0
 
-        # In LOCKED state the phase is already known. codeMargin is useful
-        # for SEARCH/REACQUIRE, but is too strict here after a speech codec:
-        # another code can correlate more strongly with a distorted guard.
-        # A competing phase may trigger REACQUIRE only if its phase shift is
-        # confirmed by the following physical guard as well.
+        if expectedGuardPos is not None:
+            _, samePosBank = self._bankCorrRange(
+                expectedGuardPos,
+                expectedGuardPos
+            )
+
+            if samePosBank is not None:
+                sameScores = samePosBank[:, 0]
+                samePosPhase = int(np.argmax(sameScores))
+                samePosCorr = float(
+                    sameScores[samePosPhase]
+                )
+
         conflict = (
-            anyPos is not None
-            and anyPhase is not None
-            and anyPhase != expectedPhase
-            and anyCorr >= self.cfg.trackThreshold
+            expectedGuardPos is not None
+            and samePosPhase is not None
+            and samePosPhase != expectedPhase
+            and samePosCorr >= self.cfg.trackThreshold
             and (
-                anyCorr - expectedCorr
+                samePosCorr - expectedCorr
                 >= self.cfg.phaseSwitchMargin
             )
         )
@@ -639,6 +651,7 @@ class FixedGuardSyncV1:
         shiftedConfirmed = False
         nextExpectedCorr = None
         nextObservedCorr = None
+        nextExpectedGuardPos = None
 
         if conflict and not final:
             nextExpectedPos = (
@@ -652,8 +665,6 @@ class FixedGuardSyncV1:
                 + self.cfg.guardSamples
             )
 
-            # Wait for one more guard instead of making a destructive
-            # phase decision from a single codec-distorted 5 ms block.
             if self.buf.end < nextNeedEnd:
                 return False
 
@@ -671,28 +682,45 @@ class FixedGuardSyncV1:
                 % self.cfg.spinnerSize
             )
             nextObservedPhase = (
-                (anyPhase + 1)
+                (samePosPhase + 1)
                 % self.cfg.spinnerSize
             )
 
-            _, nextExpectedCorr, _ = self._bestExpectedGuard(
+            (
+                nextExpectedGuardPos,
+                nextExpectedCorr,
+                _
+            ) = self._bestExpectedGuard(
                 nextExpectedPhase,
                 nextLo,
                 nextHi
             )
-            _, nextObservedCorr, _ = self._bestExpectedGuard(
-                nextObservedPhase,
-                nextLo,
-                nextHi
-            )
 
-            shiftedConfirmed = (
-                nextObservedCorr >= self.cfg.trackThreshold
-                and (
-                    nextObservedCorr - nextExpectedCorr
-                    >= self.cfg.phaseSwitchMargin
+            if nextExpectedGuardPos is not None:
+                _, nextSameBank = self._bankCorrRange(
+                    nextExpectedGuardPos,
+                    nextExpectedGuardPos
                 )
-            )
+
+                if nextSameBank is not None:
+                    nextScores = nextSameBank[:, 0]
+
+                    nextObservedCorr = float(
+                        nextScores[
+                            nextObservedPhase
+                        ]
+                    )
+
+            if nextObservedCorr is not None:
+                shiftedConfirmed = (
+                    nextObservedCorr
+                    >= self.cfg.trackThreshold
+                    and (
+                        nextObservedCorr
+                        - nextExpectedCorr
+                        >= self.cfg.phaseSwitchMargin
+                    )
+                )
 
         if conflict and shiftedConfirmed:
             self.state = "REACQUIRE"
@@ -705,16 +733,27 @@ class FixedGuardSyncV1:
                 expected_phase=expectedPhase,
                 expected_corr=expectedCorr,
                 expected_margin=expectedMargin,
-                observed_phase=anyPhase,
-                guard_pos=anyPos,
-                corr=anyCorr,
+                observed_phase=samePosPhase,
+                guard_pos=expectedGuardPos,
+                corr=samePosCorr,
                 expected_guard_pos=expectedGuardPos,
-                expected_guard_error=float(
-                    expectedGuardPos - expectedPos
-                ) if expectedGuardPos is not None else None,
-                observed_guard_error=float(
-                    anyPos - expectedPos
-                ) if anyPos is not None else None,
+                expected_guard_error=(
+                    float(
+                        expectedGuardPos
+                        - expectedPos
+                    )
+                    if expectedGuardPos is not None
+                    else None
+                ),
+                observed_guard_error=(
+                    float(
+                        expectedGuardPos
+                        - expectedPos
+                    )
+                    if expectedGuardPos is not None
+                    else None
+                ),
+                next_expected_guard_pos=nextExpectedGuardPos,
                 next_expected_corr=nextExpectedCorr,
                 next_observed_corr=nextObservedCorr,
                 phase_shift_confirmed=True
@@ -722,24 +761,24 @@ class FixedGuardSyncV1:
 
             return True
 
-        # Bias strongly toward staying locked. Once phase is known, the
-        # expected PN only has to clear the tracking threshold; it does not
-        # need to beat all seven other code templates.
+        # Пока LOCKED, ожидаемый phase важнее конкурирующих
+        # шаблонов. Для него достаточно пройти trackThreshold.
         if (
             expectedGuardPos is not None
             and expectedCorr >= self.cfg.trackThreshold
         ):
             guardPos = expectedGuardPos
             corr = expectedCorr
+
         else:
-            # If one guard was damaged but the following expected guard is
-            # already visible, bridge exactly one frame instead of launching
-            # a full reacquisition and inventing a large logical gap.
+            # Один повреждённый guard можно пережить без полного
+            # REACQUIRE, если следующий ожидаемый guard уже виден.
             if not final:
                 nextExpectedPos = (
                     expectedPos
                     + self.periodEstimate
                 )
+
                 nextNeedEnd = (
                     nextExpectedPos
                     + self.cfg.trackRadius
@@ -753,6 +792,7 @@ class FixedGuardSyncV1:
                     (expectedPhase + 1)
                     % self.cfg.spinnerSize
                 )
+
                 nextPos, nextCorr, _ = self._bestExpectedGuard(
                     nextPhase,
                     nextExpectedPos - self.cfg.trackRadius,
@@ -764,8 +804,11 @@ class FixedGuardSyncV1:
                     and nextCorr >= self.cfg.trackThreshold
                 ):
                     guardPos = int(round(expectedPos))
+
                     wall = self._wallAt(guardPos)
-                    predictedFrame = self._predictFrame(wall)
+                    predictedFrame = self._predictFrame(
+                        wall
+                    )
 
                     self._emit(
                         frameIndex,
@@ -774,8 +817,12 @@ class FixedGuardSyncV1:
                         guard_pos=guardPos,
                         corr=expectedCorr,
                         timing_error_samples=0.0,
-                        observed_period=float(self.periodEstimate),
-                        period_estimate=float(self.periodEstimate),
+                        observed_period=float(
+                            self.periodEstimate
+                        ),
+                        period_estimate=float(
+                            self.periodEstimate
+                        ),
                         predicted_frame=predictedFrame,
                         reason="single_guard_erasure"
                     )
@@ -793,6 +840,13 @@ class FixedGuardSyncV1:
 
                     return True
 
+            anyPos, anyPhase, anyCorr = (
+                self._bestAnyGuard(
+                    lo,
+                    hi
+                )
+            )
+
             self.state = "REACQUIRE"
             self.stats["track_misses"] += 1
 
@@ -805,7 +859,10 @@ class FixedGuardSyncV1:
                 expected_margin=expectedMargin,
                 expected_guard_pos=expectedGuardPos,
                 expected_guard_error=(
-                    float(expectedGuardPos - expectedPos)
+                    float(
+                        expectedGuardPos
+                        - expectedPos
+                    )
                     if expectedGuardPos is not None
                     else None
                 ),
@@ -827,7 +884,11 @@ class FixedGuardSyncV1:
         wall = self._wallAt(guardPos)
         predictedFrame = self._predictFrame(wall)
 
-        core, coreCorrection = self._coreBetweenGuards(guardPos)
+        core, coreCorrection = (
+            self._coreBetweenGuards(
+                guardPos
+            )
+        )
 
         damaged = core is None
 
@@ -837,14 +898,23 @@ class FixedGuardSyncV1:
             "lost" if damaged else "ok",
             guard_pos=guardPos,
             corr=corr,
-            timing_error_samples=float(timingError),
-            observed_period=float(observedPeriod),
-            period_estimate=float(self.periodEstimate),
+            timing_error_samples=float(
+                timingError
+            ),
+            observed_period=float(
+                observedPeriod
+            ),
+            period_estimate=float(
+                self.periodEstimate
+            ),
             predicted_frame=predictedFrame,
             core_input_samples=(
                 ""
                 if coreCorrection is None
-                else self.cfg.coreSamples + coreCorrection
+                else (
+                    self.cfg.coreSamples
+                    + coreCorrection
+                )
             ),
             core_correction_samples=(
                 ""
@@ -868,7 +938,8 @@ class FixedGuardSyncV1:
             a = self.cfg.periodAlpha
 
             self.periodEstimate = (
-                (1.0 - a) * self.periodEstimate
+                (1.0 - a)
+                * self.periodEstimate
                 + a * observedPeriod
             )
 
@@ -914,7 +985,12 @@ class FixedGuardSyncV1:
 
         lo = max(
             self.buf.base,
-            self.lastGuard + self.cfg.frameSamples // 2 if self.lastGuard is not None else self.buf.base,
+            (
+                self.lastGuard
+                + self.cfg.frameSamples // 2
+                if self.lastGuard is not None
+                else self.buf.base
+            ),
             self.buf.end - window
         )
 
@@ -1003,10 +1079,6 @@ class FixedGuardSyncV1:
             frameIndex - oldFrame
         )
 
-        # Если reacquire говорит, что это просто
-        # следующий frame, но физический интервал
-        # внезапно сильно отличился от 320 samples,
-        # именно этот payload считаем повреждённым.
         recoveredDamaged = (
             logicalGap == 1
             and abs(
@@ -1035,9 +1107,13 @@ class FixedGuardSyncV1:
             corr=train["score"],
             timing_error_samples="",
             observed_period="",
-            period_estimate=float(self.periodEstimate),
+            period_estimate=float(
+                self.periodEstimate
+            ),
             predicted_frame=best["predicted"],
-            prediction_error_frames=best["prediction_error"],
+            prediction_error_frames=best[
+                "prediction_error"
+            ],
             reason=(
                 "reacquire_timing_jump"
                 if recoveredDamaged
@@ -1071,7 +1147,9 @@ class FixedGuardSyncV1:
             recovered_frame=frameIndex,
             spinner_phase=train["phase"],
             predicted_frame=best["predicted"],
-            prediction_error_frames=best["prediction_error"],
+            prediction_error_frames=best[
+                "prediction_error"
+            ],
             skipped_frames=max(
                 0,
                 frameIndex - oldFrame - 1
