@@ -25,15 +25,18 @@ def get_default(key):
     for line in pactl("info").splitlines():
         if line.startswith(key + ":"):
             return line.split(":", 1)[1].strip()
-    raise RuntimeError(f"{key} not found")
+    raise RuntimeError(f"{key} not found in pactl info")
 
 
-def cleanup_stale():
+def cleanup_named_modules(names):
     text = pactl("list", "short", "modules")
-    needles = (f"sink_name={TX_SINK}", f"source_name={TX_MIC}", f"sink_name={RX_SINK}")
     for line in reversed(text.splitlines()):
-        if any(n in line for n in needles):
-            subprocess.run(["pactl", "unload-module", line.split()[0]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if any(name in line for name in names):
+            subprocess.run(
+                ["pactl", "unload-module", line.split()[0]],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
 
 class Modules:
@@ -43,10 +46,16 @@ class Modules:
     def load(self, *args):
         mid = pactl("load-module", *args)
         self.ids.append(mid)
+        return mid
 
     def close(self):
         for mid in reversed(self.ids):
-            subprocess.run(["pactl", "unload-module", mid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["pactl", "unload-module", mid],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        self.ids.clear()
 
 
 def index_for_name(kind, name):
@@ -102,40 +111,52 @@ def browser_streams(kind):
     return rows
 
 
-def move_and_verify_browser():
-    capture = browser_streams("source-outputs")
-    playback = browser_streams("sink-inputs")
+def route_tx_browser():
+    rows = browser_streams("source-outputs")
+    if not rows:
+        raise RuntimeError("No live browser microphone stream found. Join the Telemost call first.")
 
-    if not capture:
-        raise RuntimeError("Browser microphone stream not found. Join the Telemost call first.")
-    if not playback:
-        raise RuntimeError("Browser playback stream not found. Join the Telemost call first.")
-
-    for row in capture:
+    for row in rows:
+        print(f"Moving browser capture #{row['id']} ({row.get('application')}, {row.get('media')}) -> {TX_MIC}")
         subprocess.check_call(["pactl", "move-source-output", str(row["id"]), TX_MIC])
 
-    for row in playback:
+    time.sleep(0.3)
+
+    expected = index_for_name("sources", TX_MIC)
+    rows = browser_streams("source-outputs")
+    bad = False
+
+    for row in rows:
+        ok = row.get("route_index") == expected
+        print(f"TX ROUTE {'OK' if ok else 'BAD'}: browser #{row['id']} source={row.get('route_index')} expected={expected} app={row.get('application')} media={row.get('media')}")
+        bad |= not ok
+
+    if bad:
+        raise RuntimeError("TX browser capture is not routed to the virtual microphone")
+
+
+def route_rx_browser():
+    rows = browser_streams("sink-inputs")
+    if not rows:
+        raise RuntimeError("No live browser playback stream found. Join the Telemost call first.")
+
+    for row in rows:
+        print(f"Moving browser playback #{row['id']} ({row.get('application')}, {row.get('media')}) -> {RX_SINK}")
         subprocess.check_call(["pactl", "move-sink-input", str(row["id"]), RX_SINK])
 
     time.sleep(0.3)
 
-    tx_index = index_for_name("sources", TX_MIC)
-    rx_index = index_for_name("sinks", RX_SINK)
+    expected = index_for_name("sinks", RX_SINK)
+    rows = browser_streams("sink-inputs")
+    bad = False
 
-    capture = browser_streams("source-outputs")
-    playback = browser_streams("sink-inputs")
+    for row in rows:
+        ok = row.get("route_index") == expected
+        print(f"RX ROUTE {'OK' if ok else 'BAD'}: browser #{row['id']} sink={row.get('route_index')} expected={expected} app={row.get('application')} media={row.get('media')}")
+        bad |= not ok
 
-    for row in capture:
-        ok = row.get("route_index") == tx_index
-        print(f"TX ROUTE {'OK' if ok else 'BAD'}: browser #{row['id']} app={row.get('application')} media={row.get('media')} source={row.get('route_index')} expected={tx_index}")
-        if not ok:
-            raise RuntimeError("TX browser stream did not move to virtual mic")
-
-    for row in playback:
-        ok = row.get("route_index") == rx_index
-        print(f"RX ROUTE {'OK' if ok else 'BAD'}: browser #{row['id']} app={row.get('application')} media={row.get('media')} sink={row.get('route_index')} expected={rx_index}")
-        if not ok:
-            raise RuntimeError("RX browser stream did not move to virtual speaker")
+    if bad:
+        raise RuntimeError("RX browser playback is not routed to the virtual sink")
 
 
 def read_exact(stream, n):
@@ -171,15 +192,23 @@ class Wav:
 
 
 def tx_worker(stop, physical_source, outdir, proof):
-    src = subprocess.Popen(["parec", f"--device={physical_source}", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"], stdout=subprocess.PIPE, bufsize=0)
-    dst = subprocess.Popen(["pacat", f"--device={TX_SINK}", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"], stdin=subprocess.PIPE, bufsize=0)
+    src = subprocess.Popen(
+        ["parec", f"--device={physical_source}", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"],
+        stdout=subprocess.PIPE,
+        bufsize=0,
+    )
+    dst = subprocess.Popen(
+        ["pacat", f"--device={TX_SINK}", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"],
+        stdin=subprocess.PIPE,
+        bufsize=0,
+    )
 
     w_in = Wav(Path(outdir) / "tx_physical.wav")
-    w_out = Wav(Path(outdir) / "tx_python_out.wav")
+    w_out = Wav(Path(outdir) / "tx_to_virtual.wav")
 
     sample_index = 0
-    sum_in = 0.0
-    sum_out = 0.0
+    energy_in = 0.0
+    energy_out = 0.0
     count = 0
     next_print = time.monotonic() + 1.0
 
@@ -194,8 +223,8 @@ def tx_worker(stop, physical_source, outdir, proof):
 
             if proof:
                 n = np.arange(BLOCK, dtype=np.int64) + sample_index
-                in_burst = (n % RATE) < int(0.120 * RATE)
-                y[in_burst] += 0.12 * np.sin(2.0 * np.pi * 880.0 * n[in_burst] / RATE)
+                mask = (n % RATE) < int(0.120 * RATE)
+                y[mask] += 0.12 * np.sin(2.0 * np.pi * 880.0 * n[mask] / RATE)
 
             y = np.clip(y, -0.999, 0.999)
 
@@ -203,17 +232,17 @@ def tx_worker(stop, physical_source, outdir, proof):
             w_out.write(y)
             dst.stdin.write(float_to_pcm(y))
 
-            sum_in += float(np.sum(x * x))
-            sum_out += float(np.sum(y * y))
+            energy_in += float(np.sum(x * x))
+            energy_out += float(np.sum(y * y))
             count += len(x)
             sample_index += len(x)
 
             if time.monotonic() >= next_print:
-                rms_in = (sum_in / max(count, 1)) ** 0.5
-                rms_out = (sum_out / max(count, 1)) ** 0.5
-                print(f"TX physical_rms={rms_in:.6f} python_out_rms={rms_out:.6f}")
-                sum_in = 0.0
-                sum_out = 0.0
+                rms_in = (energy_in / max(count, 1)) ** 0.5
+                rms_out = (energy_out / max(count, 1)) ** 0.5
+                print(f"TX PATH: physical_rms={rms_in:.6f} python_to_virtual_rms={rms_out:.6f}", flush=True)
+                energy_in = 0.0
+                energy_out = 0.0
                 count = 0
                 next_print += 1.0
     finally:
@@ -224,11 +253,19 @@ def tx_worker(stop, physical_source, outdir, proof):
 
 
 def rx_worker(stop, physical_sink, outdir):
-    src = subprocess.Popen(["parec", f"--device={RX_SINK}.monitor", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"], stdout=subprocess.PIPE, bufsize=0)
-    dst = subprocess.Popen(["pacat", f"--device={physical_sink}", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"], stdin=subprocess.PIPE, bufsize=0)
+    src = subprocess.Popen(
+        ["parec", f"--device={RX_SINK}.monitor", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"],
+        stdout=subprocess.PIPE,
+        bufsize=0,
+    )
+    dst = subprocess.Popen(
+        ["pacat", f"--device={physical_sink}", "--format=s16le", f"--rate={RATE}", "--channels=1", "--latency-msec=20"],
+        stdin=subprocess.PIPE,
+        bufsize=0,
+    )
 
-    w_in = Wav(Path(outdir) / "rx_virtual_in.wav")
-    w_out = Wav(Path(outdir) / "rx_python_out.wav")
+    w_in = Wav(Path(outdir) / "rx_from_virtual.wav")
+    w_out = Wav(Path(outdir) / "rx_to_physical.wav")
 
     energy = 0.0
     count = 0
@@ -241,7 +278,6 @@ def rx_worker(stop, physical_sink, outdir):
                 break
 
             x = pcm_to_float(data)
-
             w_in.write(x)
             w_out.write(x)
             dst.stdin.write(data)
@@ -251,7 +287,8 @@ def rx_worker(stop, physical_sink, outdir):
 
             if time.monotonic() >= next_print:
                 rms = (energy / max(count, 1)) ** 0.5
-                print(f"RX {'SIGNAL' if rms > 1e-6 else 'SILENCE'} virtual_rms={rms:.6f} -> physical speaker")
+                state = "SIGNAL" if rms > 1e-6 else "SILENCE"
+                print(f"RX PATH: {state} virtual_rms={rms:.6f} -> physical speaker", flush=True)
                 energy = 0.0
                 count = 0
                 next_print += 1.0
@@ -262,59 +299,98 @@ def rx_worker(stop, physical_sink, outdir):
         dst.terminate()
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--out", default="route_probe")
-    p.add_argument("--proof", action="store_true")
-    args = p.parse_args()
-
-    outdir = Path(args.out)
-    outdir.mkdir(parents=True, exist_ok=True)
-
+def run_tx(args):
     physical_source = get_default("Default Source")
-    physical_sink = get_default("Default Sink")
+    print(f"TX physical microphone: {physical_source}")
 
-    cleanup_stale()
+    cleanup_named_modules((f"sink_name={TX_SINK}", f"source_name={TX_MIC}"))
     modules = Modules()
     stop = threading.Event()
+    worker = None
 
     try:
         modules.load("module-null-sink", f"sink_name={TX_SINK}", "sink_properties=device.description=RouteTest_TX")
         modules.load("module-remap-source", f"master={TX_SINK}.monitor", f"source_name={TX_MIC}", "source_properties=device.description=RouteTest_TX_Microphone")
-        modules.load("module-null-sink", f"sink_name={RX_SINK}", "sink_properties=device.description=RouteTest_RX")
 
-        print(f"Physical mic: {physical_source}")
-        print(f"Physical speaker: {physical_sink}")
-        print(f"Virtual TX mic: {TX_MIC}")
-        print(f"Virtual RX speaker: {RX_SINK}")
+        print(f"TX virtual microphone ready: {TX_MIC}")
+        print("TX IS PAUSED HERE. No Python audio worker is running yet.")
+        input("TX COMPUTER: join the Telemost call in Chrome, then press ENTER here: ")
 
-        tx = threading.Thread(target=tx_worker, args=(stop, physical_source, outdir, args.proof), daemon=True)
-        rx = threading.Thread(target=rx_worker, args=(stop, physical_sink, outdir), daemon=True)
-        tx.start()
-        rx.start()
+        worker = threading.Thread(target=tx_worker, args=(stop, physical_source, args.out, args.proof), daemon=True)
+        worker.start()
+        time.sleep(0.4)
 
-        print("Join the Telemost call in Chrome now. The script will force the live Chrome streams onto the virtual devices.")
-        input("When both microphone and playback streams exist, press ENTER: ")
+        route_tx_browser()
 
-        move_and_verify_browser()
-
-        print("FULL DUPLEX ROUTE ACTIVE")
-        print(f"TX: {physical_source} -> Python -> {TX_SINK} -> {TX_MIC} -> Chrome/Telemost")
-        print(f"RX: Chrome/Telemost -> {RX_SINK} -> Python -> {physical_sink}")
+        print("TX PATH ACTIVE")
+        print(f"{physical_source} -> Python -> {TX_SINK} -> {TX_MIC} -> Chrome/Telemost")
         if args.proof:
-            print("PROOF marker is ON: remote side should hear a short 880 Hz beep every second.")
-        print("Ctrl+C to stop.")
+            print("PROOF ON: the remote computer should hear a 120 ms / 880 Hz beep once per second.")
+        print("Press Ctrl+C to stop TX.")
 
-        while tx.is_alive() and rx.is_alive():
+        while worker.is_alive():
             time.sleep(0.2)
 
     except KeyboardInterrupt:
-        print("Stopping...")
+        print("TX stopping...")
     finally:
         stop.set()
-        tx.join(timeout=2) if "tx" in locals() else None
-        rx.join(timeout=2) if "rx" in locals() else None
+        if worker is not None:
+            worker.join(timeout=2)
         modules.close()
+
+
+def run_rx(args):
+    physical_sink = get_default("Default Sink")
+    print(f"RX physical speaker: {physical_sink}")
+
+    cleanup_named_modules((f"sink_name={RX_SINK}",))
+    modules = Modules()
+    stop = threading.Event()
+    worker = None
+
+    try:
+        modules.load("module-null-sink", f"sink_name={RX_SINK}", "sink_properties=device.description=RouteTest_RX")
+
+        print(f"RX virtual speaker ready: {RX_SINK}")
+        print("RX IS PAUSED HERE. No Python audio worker is running yet.")
+        input("RX COMPUTER: join the Telemost call in Chrome, then press ENTER here: ")
+
+        worker = threading.Thread(target=rx_worker, args=(stop, physical_sink, args.out), daemon=True)
+        worker.start()
+        time.sleep(0.4)
+
+        route_rx_browser()
+
+        print("RX PATH ACTIVE")
+        print(f"Chrome/Telemost -> {RX_SINK} -> Python -> {physical_sink}")
+        print("Press Ctrl+C to stop RX.")
+
+        while worker.is_alive():
+            time.sleep(0.2)
+
+    except KeyboardInterrupt:
+        print("RX stopping...")
+    finally:
+        stop.set()
+        if worker is not None:
+            worker.join(timeout=2)
+        modules.close()
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--role", choices=("tx", "rx"), required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--proof", action="store_true")
+    args = p.parse_args()
+
+    Path(args.out).mkdir(parents=True, exist_ok=True)
+
+    if args.role == "tx":
+        run_tx(args)
+    else:
+        run_rx(args)
 
 
 if __name__ == "__main__":
