@@ -1,18 +1,9 @@
 from dataclasses import dataclass
 import time
-
 import numpy as np
 from scipy.signal import find_peaks, firwin
-
-
-# Optimized offline for lower pairwise cross-correlation after the
-# exact FIR band-pass + taper used below. Both TX and RX must use
-# the same bank.
-_GUARD_SEEDS = [
-    30015, 34260, 34763, 30724,
-    33147, 32761, 31392, 34460
-]
-
+# API class names stay V1-compatible; this file is the V2 implementation.
+_GUARD_SEEDS = [30015, 34260, 34763, 30724, 33147, 32761, 31392, 34460]
 
 @dataclass
 class SyncV1Config:
@@ -20,62 +11,46 @@ class SyncV1Config:
     frameSamples: int = 320
     coreSamples: int = 240
     guardSamples: int = 80
-
     spinnerSize: int = 8
-
     acquireThreshold: float = 0.28
-    trackThreshold: float = 0.20
-
+    trackThreshold: float = 0.2
     acquireConfirm: int = 8
-
-    # ±120 samples = ±7.5 ms.
-    trackRadius: int = 48
-
-    # При проверке train каждый следующий guard
-    # может гулять только совсем немного.
+    reacquireConfirm: int = 3
+    trackRadius: int = 72
+    trackRecoveryRadius: int = 128
     trainRadius: int = 8
-
-    # Если период между соседними guard изменился
-    # сильнее чем на 24 samples = 1.5 ms,
-    # текущий payload считаем повреждённым.
+    trackConfirm: int = 3
+    trackContinuityRadius: int = 16
+    trackChainOffsetSpread: int = 12
+    trackLookaheadFrames: int = 8
+    trackStrongThreshold: float = 0.70
     maxTimingJump: int = 24
-
-    # Moderate codec/jitter-buffer time warps are recoverable by resampling
-    # the physical payload between two detected guards back to 240 samples.
-    maxCoreAdjust: int = 48
-
+    maxCoreAdjust: int = 64
     periodAlpha: float = 0.02
-
-    # Guards постоянно подтягивают wall-clock predictor.
+    gapRecoveryInterpolationOnlyFrames: int = 4
+    gapRecoveryConfirm: int = 3
+    gapRecoveryCoherence: int = 8
+    gapRecoveryMargin: float = 0.04
+    gapRecoveryThreshold: float = 0.28
+    gapRecoveryRadius: int = 16
+    gapRecoveryMaxFrames: int = 64
+    gapRecoveryAllowEstimated: bool = True
+    gapRecoveryMaxAnchorPredictionError: float = 1.0
     wallAlpha: float = 0.08
-
-    # Сколько последних кадров держать для SEARCH/REACQUIRE.
     searchWindowFrames: int = 16
-
-    # При spinnerSize=8 разрешаем predictor ошибаться
-    # меньше чем на половину цикла.
     maxPredictionErrorFrames: float = 3.5
     codeMargin: float = 0.04
-
-    # While LOCKED, do not abandon the expected spinner phase because of
-    # one codec-distorted guard. A different phase must win across two
-    # consecutive guards by at least this correlation advantage.
     phaseSwitchMargin: float = 0.08
-
 
 def makeGuardBank(rate=16000, samples=80, count=8):
     if count < 2 or count > len(_GUARD_SEEDS):
-        raise ValueError(f"spinnerSize must be 2..{len(_GUARD_SEEDS)}")
-
+        raise ValueError(f'spinnerSize must be from 2 to {len(_GUARD_SEEDS)}')
     taps = firwin(31, [300, 3400], pass_zero=False, fs=rate)
     guards = []
-
     for seed in _GUARD_SEEDS[:count]:
         rng = np.random.default_rng(seed)
         raw = rng.choice((-1.0, 1.0), size=samples + 30)
-
-        x = np.convolve(raw, taps, mode="same")[15:15 + samples]
-
+        x = np.convolve(raw, taps, mode='same')[15:15 + samples]
         ramp = min(6, samples // 4)
         if ramp:
             r = np.sin(np.linspace(0, np.pi / 2, ramp)) ** 2
@@ -83,19 +58,15 @@ def makeGuardBank(rate=16000, samples=80, count=8):
             w[:ramp] = r
             w[-ramp:] = r[::-1]
             x *= w
-
         x /= np.sqrt(np.mean(x * x) + 1e-12)
         guards.append(x.astype(np.float32))
-
     return np.stack(guards)
 
-
-# Оставляем для совместимости со старым кодом.
 def makeGuard(rate=16000, samples=80):
     return makeGuardBank(rate, samples, 2)[0]
 
-
 class _SampleBuffer:
+
     def __init__(self):
         self.base = 0
         self.data = np.empty(0, dtype=np.float32)
@@ -112,1068 +83,605 @@ class _SampleBuffer:
     def slice(self, start, end):
         if start < self.base or end > self.end or end < start:
             return None
-
-        return self.data[
-            start - self.base:
-            end - self.base
-        ]
+        return self.data[start - self.base:end - self.base]
 
     def discardBefore(self, index):
         index = min(max(index, self.base), self.end)
         n = index - self.base
-
         if n:
             self.data = self.data[n:]
             self.base = index
 
-
 class FixedGuardSyncV1:
+
     def __init__(self, cfg=None, onFrame=None, onEvent=None):
         self.cfg = cfg or SyncV1Config()
-
         if self.cfg.rate != 16000:
-            raise ValueError("SyncV1 currently expects 16000 Hz")
-
+            raise ValueError('SyncV1 currently expects 16000 Hz')
         if self.cfg.coreSamples + self.cfg.guardSamples != self.cfg.frameSamples:
-            raise ValueError("coreSamples + guardSamples must equal frameSamples")
-
-        self.guards = makeGuardBank(
-            self.cfg.rate,
-            self.cfg.guardSamples,
-            self.cfg.spinnerSize
-        )
-
-        self.guardNorms = np.linalg.norm(self.guards, axis=1)
-
+            raise ValueError('coreSamples + guardSamples must equal frameSamples')
+        self.guards = makeGuardBank(self.cfg.rate, self.cfg.guardSamples, self.cfg.spinnerSize)
+        self.detectorTaps = firwin(31, [300, 3400], pass_zero=False, fs=self.cfg.rate).astype(np.float32)
+        self.detectorHalf = (len(self.detectorTaps) - 1) // 2
+        self.detectorGuards = np.stack([np.convolve(guard, self.detectorTaps, mode='same') for guard in self.guards]).astype(np.float32)
+        self.detectorGuardNorms = np.linalg.norm(self.detectorGuards, axis=1)
         self.onFrame = onFrame or (lambda *args: None)
         self.onEvent = onEvent or (lambda *args: None)
-
         self.buf = _SampleBuffer()
-
-        self.state = "SEARCH"
-
+        self.state = 'SEARCH'
         self.lastGuard = None
         self.lastFrame = -1
-
-        # Оценка physical RX samples / logical frame.
         self.periodEstimate = float(self.cfg.frameSamples)
-
-        # wall time, при котором логический frame 0
-        # должен был иметь свой guard.
         self.epochWall = None
-
         self.tailIndex = 0
         self.tailWall = None
-
         self.lastReacquireSearchEnd = -1
-
-        self.stats = {
-            "frames_ok": 0,
-            "frames_lost": 0,
-            "acquisitions": 0,
-            "reacquisitions": 0,
-            "track_misses": 0,
-            "spinner_mismatches": 0
-        }
+        self.stats = {'frames_ok': 0, 'frames_lost': 0, 'acquisitions': 0, 'reacquisitions': 0, 'track_misses': 0, 'spinner_mismatches': 0}
 
     def push(self, samples, tailWall=None):
         samples = np.asarray(samples, dtype=np.float32)
-
         if not len(samples):
             return
-
         self.buf.append(samples)
-
         self.tailIndex = self.buf.end
-        self.tailWall = (
-            time.monotonic()
-            if tailWall is None
-            else tailWall
-        )
-
+        self.tailWall = time.monotonic() if tailWall is None else tailWall
         while True:
-            if self.state == "SEARCH":
+            if self.state == 'SEARCH':
                 progressed = self._acquire()
-            elif self.state == "LOCKED":
+            elif self.state == 'LOCKED':
                 progressed = self._track()
             else:
                 progressed = self._reacquire()
-
             if not progressed:
                 break
-
         self._prune()
 
     def finish(self):
-        # Нужен главным образом offline-тестам:
-        # позволяет обработать последний полный guard,
-        # хотя справа уже нет trackRadius samples.
-        while self.state == "LOCKED":
+        half = self.detectorHalf
+        if half > 0:
+            self.buf.append(np.zeros(half, dtype=np.float32))
+            if self.tailWall is not None:
+                self.tailWall += half / self.cfg.rate
+            self.tailIndex = self.buf.end
+        while self.state == 'LOCKED':
             if not self._track(final=True):
                 break
 
     def _wallAt(self, sampleIndex):
         if self.tailWall is None:
             return None
-
-        return self.tailWall - (
-            self.tailIndex - sampleIndex
-        ) / self.cfg.rate
+        return self.tailWall - (self.tailIndex - sampleIndex) / self.cfg.rate
 
     def _predictFrame(self, wall):
         if wall is None or self.epochWall is None:
             return None
-
         frameSec = self.cfg.frameSamples / self.cfg.rate
         return (wall - self.epochWall) / frameSec
 
     def _alignPredictor(self, frameIndex, guardPos, hard=False):
         wall = self._wallAt(guardPos)
-
         if wall is None:
             return
-
         frameSec = self.cfg.frameSamples / self.cfg.rate
         observedEpoch = wall - frameIndex * frameSec
-
         if self.epochWall is None or hard:
             self.epochWall = observedEpoch
         else:
             a = self.cfg.wallAlpha
-            self.epochWall = (
-                (1.0 - a) * self.epochWall
-                + a * observedEpoch
-            )
+            self.epochWall = (1.0 - a) * self.epochWall + a * observedEpoch
 
     def _bankCorrRange(self, lo, hi):
         L = self.cfg.guardSamples
-
         lo = max(int(lo), self.buf.base)
         hi = min(int(hi), self.buf.end - L)
-
         if hi < lo:
-            return None, None
-
-        x = self.buf.slice(lo, hi + L)
-
-        if x is None or len(x) < L:
-            return None, None
-
-        energy = np.sqrt(
-            np.convolve(
-                x * x,
-                np.ones(L, dtype=np.float32),
-                mode="valid"
-            )
-        )
-
+            return (None, None)
+        half = self.detectorHalf
+        lo = max(int(lo), self.buf.base + half)
+        hi = min(int(hi), self.buf.end - L - half)
+        if hi < lo:
+            return (None, None)
+        raw = self.buf.slice(lo - half, hi + half + L)
+        if raw is None:
+            return (None, None)
+        x = np.convolve(raw, self.detectorTaps, mode='valid')
+        if len(x) < L:
+            return (None, None)
+        energy = np.sqrt(np.convolve(x * x, np.ones(L, dtype=np.float32), mode='valid'))
         corr = []
-
-        for i, guard in enumerate(self.guards):
-            dots = np.correlate(x, guard, mode="valid")
-
-            corr.append(
-                dots / (
-                    energy * self.guardNorms[i]
-                    + 1e-12
-                )
-            )
-
+        for i, guard in enumerate(self.detectorGuards):
+            dots = np.correlate(x, guard, mode='valid')
+            corr.append(dots / (energy * self.detectorGuardNorms[i] + 1e-12))
         positions = np.arange(lo, lo + len(corr[0]))
-        return positions, np.stack(corr)
+        return (positions, np.stack(corr))
 
     def _bestAnyGuard(self, lo, hi):
         positions, corr = self._bankCorrRange(lo, hi)
-
         if positions is None:
-            return None, None, 0.0
-
+            return (None, None, 0.0)
         flat = int(np.argmax(corr))
-        code, posIndex = np.unravel_index(
-            flat,
-            corr.shape
-        )
-
-        return (
-            int(positions[posIndex]),
-            int(code),
-            float(corr[code, posIndex])
-        )
+        code, posIndex = np.unravel_index(flat, corr.shape)
+        return (int(positions[posIndex]), int(code), float(corr[code, posIndex]))
 
     def _bestExpectedGuard(self, code, lo, hi):
         positions, corr = self._bankCorrRange(lo, hi)
-
         if positions is None:
-            return None, 0.0, 0.0
-
+            return (None, 0.0, 0.0)
         row = corr[code]
         i = int(np.argmax(row))
-
         value = float(row[i])
-
         others = np.delete(corr[:, i], code)
         second = float(np.max(others)) if len(others) else -1.0
         margin = value - second
+        return (int(positions[i]), value, margin)
 
-        return int(positions[i]), value, margin
-
-    def _findTrains(self, lo, hi, threshold):
+    def _findTrains(self, lo, hi, threshold, confirmCount):
         positions, corr = self._bankCorrRange(lo, hi)
-
         if positions is None:
             return []
-
         bestCorr = np.max(corr, axis=0)
         bestCode = np.argmax(corr, axis=0)
-
-        peaks, _ = find_peaks(
-            bestCorr,
-            height=threshold,
-            distance=max(20, self.cfg.guardSamples // 2)
-        )
-
+        peaks, _ = find_peaks(bestCorr, height=threshold, distance=max(20, self.cfg.guardSamples // 2))
         trains = []
-
         for peak in peaks:
             firstPos = int(positions[peak])
             firstCode = int(bestCode[peak])
             firstValue = float(bestCorr[peak])
-
             column = corr[:, peak]
             others = np.delete(column, firstCode)
             firstMargin = firstValue - float(np.max(others))
-
             if firstMargin < self.cfg.codeMargin:
                 continue
-
             values = [firstValue]
             margins = [firstMargin]
             positionsFound = [firstPos]
-
             ok = True
-
-            for j in range(1, self.cfg.acquireConfirm):
+            for j in range(1, confirmCount):
                 expectedPos = firstPos + j * self.cfg.frameSamples
                 expectedCode = (firstCode + j) % self.cfg.spinnerSize
-
-                pos, value, margin = self._bestExpectedGuard(
-                    expectedCode,
-                    expectedPos - self.cfg.trainRadius,
-                    expectedPos + self.cfg.trainRadius
-                )
-
+                pos, value, margin = self._bestExpectedGuard(expectedCode, expectedPos - self.cfg.trainRadius, expectedPos + self.cfg.trainRadius)
                 if pos is None or value < threshold or margin < self.cfg.codeMargin:
                     ok = False
                     break
-
                 positionsFound.append(pos)
                 values.append(value)
                 margins.append(margin)
-
             if ok:
-                trains.append({
-                    "pos": firstPos,
-                    "phase": firstCode,
-                    "score": float(np.mean(values)),
-                    "min_margin": float(np.min(margins)),
-                    "positions": positionsFound
-                })
-
+                trains.append({'pos': firstPos, 'phase': firstCode, 'score': float(np.mean(values)), 'min_margin': float(np.min(margins)), 'positions': positionsFound, 'corrs': [float(v) for v in values], 'min_corr': float(np.min(values))})
         return trains
 
     def _resolveFrameIndex(self, phase, guardPos):
         wall = self._wallAt(guardPos)
         predicted = self._predictFrame(wall)
-
         if predicted is None:
-            return phase, float(phase)
-
+            return (phase, float(phase))
         cycle = self.cfg.spinnerSize
-
-        k0 = int(round(
-            (predicted - phase) / cycle
-        ))
-
+        k0 = int(round((predicted - phase) / cycle))
         candidates = []
-
         for dk in range(-3, 4):
             n = phase + (k0 + dk) * cycle
-
             if n > self.lastFrame:
                 candidates.append(n)
-
         if not candidates:
-            return None, predicted
-
-        best = min(
-            candidates,
-            key=lambda n: abs(n - predicted)
-        )
-
-        return int(best), float(predicted)
+            return (None, predicted)
+        best = min(candidates, key=lambda n: abs(n - predicted))
+        return (int(best), float(predicted))
 
     def _coreAt(self, guardPos):
-        return self.buf.slice(
-            guardPos - self.cfg.coreSamples,
-            guardPos
-        )
+        return self.buf.slice(guardPos - self.cfg.coreSamples, guardPos)
+
+    def _coreBetweenPositions(self, previousGuardPos, guardPos):
+        start = previousGuardPos + self.cfg.guardSamples
+        end = guardPos
+        core = self.buf.slice(start, end)
+        if core is None or len(core) < 2:
+            return (None, None)
+        correction = len(core) - self.cfg.coreSamples
+        if abs(correction) > self.cfg.maxCoreAdjust:
+            return (None, correction)
+        if len(core) == self.cfg.coreSamples:
+            return (core.copy(), 0)
+        src = np.arange(len(core), dtype=np.float64)
+        dst = np.linspace(0.0, len(core) - 1.0, self.cfg.coreSamples)
+        normalized = np.interp(dst, src, core).astype(np.float32)
+        return (normalized, correction)
 
     def _coreBetweenGuards(self, guardPos):
         if self.lastGuard is None:
-            return self._coreAt(guardPos), 0
+            return (self._coreAt(guardPos), 0)
+        return self._coreBetweenPositions(self.lastGuard, guardPos)
 
-        start = self.lastGuard + self.cfg.guardSamples
-        end = guardPos
-        core = self.buf.slice(start, end)
+    def _recoverGap(self, oldFrame, oldGuard, newFrame, newGuard, newGuardCorr):
+        # Recover buffered frames between two trusted anchors; short gaps use interpolation only.
+        logicalGap = newFrame - oldFrame
+        if logicalGap <= 0:
+            return {'emitted': 0, 'recovered': 0, 'lost': 0, 'detected_guards': 0, 'estimated_guards': 0}
+        if logicalGap > self.cfg.gapRecoveryMaxFrames:
+            for frameIdx in range(oldFrame + 1, newFrame):
+                self._emit(frameIdx, None, 'lost', reason='gap_too_huge_for_recovery')
+            core = self._coreAt(newGuard)
+            status = 'ok' if core is not None else 'lost'
+            self._emit(newFrame, core.copy() if core is not None else None, status, guard_pos=newGuard, corr=newGuardCorr, recovered_gap=False, guard_source='anchor', reason='' if status == 'ok' else 'anchor_core_missing')
+            recovered = 1 if status == 'ok' else 0
+            return {'emitted': logicalGap, 'recovered': recovered, 'lost': logicalGap - recovered, 'detected_guards': 0, 'estimated_guards': 0}
+        positions = {oldFrame: int(oldGuard), newFrame: int(newGuard)}
+        sources = {oldFrame: 'anchor', newFrame: 'anchor'}
+        correlations = {oldFrame: None, newFrame: float(newGuardCorr)}
+        physicalSpan = float(newGuard - oldGuard)
+        timelineDelta = physicalSpan - logicalGap * self.cfg.frameSamples
 
-        if core is None or len(core) < 2:
-            return None, None
+        if abs(timelineDelta) >= self.cfg.frameSamples - self.cfg.maxTimingJump:
+            recovered = 0
+            lost = 0
 
-        correction = len(core) - self.cfg.coreSamples
+            for frameIdx in range(oldFrame + 1, newFrame):
+                self._emit(frameIdx, None, "lost", reason="whole_frame_timeline_gap")
+                lost += 1
 
-        if abs(correction) > self.cfg.maxCoreAdjust:
-            return None, correction
+            core = self._coreAt(newGuard)
+            status = "ok" if core is not None else "lost"
 
-        if len(core) == self.cfg.coreSamples:
-            return core.copy(), 0
+            self._emit(
+                newFrame, core.copy() if core is not None else None, status,
+                guard_pos=newGuard, corr=newGuardCorr, recovered_gap=True,
+                guard_source="anchor", timeline_delta_samples=float(timelineDelta),
+                reason="" if status == "ok" else "anchor_core_missing"
+            )
 
-        src = np.arange(len(core), dtype=np.float64)
-        dst = np.linspace(0.0, len(core) - 1.0, self.cfg.coreSamples)
+            recovered += int(status == "ok")
+            lost += int(status != "ok")
 
-        normalized = np.interp(dst, src, core).astype(np.float32)
-        return normalized, correction
+            return {
+                "emitted": logicalGap, "recovered": recovered, "lost": lost,
+                "detected_guards": 0, "estimated_guards": 0
+            }
+        candidates = {}
+        allowPnRefinement = logicalGap > self.cfg.gapRecoveryInterpolationOnlyFrames
+        if allowPnRefinement:
+            for frameIdx in range(oldFrame + 1, newFrame):
+                alpha = (frameIdx - oldFrame) / logicalGap
+                predictedPos = oldGuard + alpha * physicalSpan
+                phase = frameIdx % self.cfg.spinnerSize
+                guardPos, corr, margin = self._bestExpectedGuard(phase, predictedPos - self.cfg.gapRecoveryRadius, predictedPos + self.cfg.gapRecoveryRadius)
+                if guardPos is None or corr < self.cfg.gapRecoveryThreshold or margin < self.cfg.gapRecoveryMargin:
+                    continue
+                candidates[frameIdx] = {'pos': int(guardPos), 'corr': float(corr), 'margin': float(margin), 'offset': float(guardPos - predictedPos)}
+        accepted = set()
+        if candidates:
+            run = []
+            runOffsets = []
+
+            def flushRun():
+                if len(run) >= self.cfg.gapRecoveryConfirm:
+                    accepted.update(run)
+            previousFrame = None
+            for frameIdx in range(oldFrame + 1, newFrame):
+                candidate = candidates.get(frameIdx)
+                if candidate is None:
+                    flushRun()
+                    run = []
+                    runOffsets = []
+                    previousFrame = None
+                    continue
+                offset = candidate['offset']
+                if previousFrame is not None and frameIdx == previousFrame + 1:
+                    prospectiveOffsets = runOffsets + [offset]
+                    spread = max(prospectiveOffsets) - min(prospectiveOffsets)
+                    if spread <= self.cfg.gapRecoveryCoherence:
+                        run.append(frameIdx)
+                        runOffsets.append(offset)
+                    else:
+                        flushRun()
+                        run = [frameIdx]
+                        runOffsets = [offset]
+                else:
+                    flushRun()
+                    run = [frameIdx]
+                    runOffsets = [offset]
+                previousFrame = frameIdx
+            flushRun()
+        for frameIdx in sorted(accepted):
+            candidate = candidates[frameIdx]
+            positions[frameIdx] = candidate['pos']
+            sources[frameIdx] = 'detected'
+            correlations[frameIdx] = candidate['corr']
+        anchorFrames = sorted(positions)
+        for leftIndex in range(len(anchorFrames) - 1):
+            leftFrame = anchorFrames[leftIndex]
+            rightFrame = anchorFrames[leftIndex + 1]
+            leftPos = positions[leftFrame]
+            rightPos = positions[rightFrame]
+            spanFrames = rightFrame - leftFrame
+            for frameIdx in range(leftFrame + 1, rightFrame):
+                if frameIdx in positions:
+                    continue
+                alpha = (frameIdx - leftFrame) / spanFrames
+                estimatedPos = int(round(leftPos + alpha * (rightPos - leftPos)))
+                positions[frameIdx] = estimatedPos
+                sources[frameIdx] = 'estimated'
+                correlations[frameIdx] = None
+        recovered = 0
+        lost = 0
+        for frameIdx in range(oldFrame + 1, newFrame + 1):
+            prevGuardPos = positions[frameIdx - 1]
+            guardPos = positions[frameIdx]
+            core, correction = self._coreBetweenPositions(prevGuardPos, guardPos)
+            usesEstimate = sources[frameIdx - 1] == 'estimated' or sources[frameIdx] == 'estimated'
+            canUse = core is not None and (self.cfg.gapRecoveryAllowEstimated or not usesEstimate)
+            if canUse:
+                status = 'ok'
+                payload = core
+                recovered += 1
+            else:
+                status = 'lost'
+                payload = None
+                lost += 1
+            self._emit(frameIdx, payload, status, guard_pos=guardPos, corr='' if correlations[frameIdx] is None else correlations[frameIdx], recovered_gap=True, guard_source=sources[frameIdx], previous_guard_source=sources[frameIdx - 1], core_input_samples='' if correction is None else self.cfg.coreSamples + correction, core_correction_samples='' if correction is None else correction, reason='' if canUse else 'estimated_boundary_not_allowed' if core is not None else 'gap_core_adjust_too_large')
+        return {'emitted': logicalGap, 'recovered': recovered, 'lost': lost, 'detected_guards': sum((1 for frameIndex in range(oldFrame + 1, newFrame) if sources[frameIndex] == 'detected')), 'estimated_guards': sum((1 for frameIndex in range(oldFrame + 1, newFrame) if sources[frameIndex] == 'estimated'))}
 
     def _emit(self, frameIndex, core, status, **meta):
-        out = np.zeros(
-            self.cfg.frameSamples,
-            dtype=np.float32
-        )
-
-        if status == "ok" and core is not None:
+        out = np.zeros(self.cfg.frameSamples, dtype=np.float32)
+        if status == 'ok' and core is not None:
             out[:self.cfg.coreSamples] = core
-
-        if status == "ok":
-            self.stats["frames_ok"] += 1
+        if status == 'ok':
+            self.stats['frames_ok'] += 1
         else:
-            self.stats["frames_lost"] += 1
-
-        meta["spinner_phase"] = (
-            frameIndex % self.cfg.spinnerSize
-        )
-
-        self.onFrame(
-            frameIndex,
-            out,
-            status,
-            meta
-        )
+            self.stats['frames_lost'] += 1
+        meta['spinner_phase'] = frameIndex % self.cfg.spinnerSize
+        self.onFrame(frameIndex, out, status, meta)
 
     def _event(self, name, **fields):
-        fields["event"] = name
-        fields["state"] = self.state
+        fields['event'] = name
+        fields['state'] = self.state
         self.onEvent(fields)
 
     def _acquire(self):
-        confirmSpan = (
-            self.cfg.guardSamples
-            + (self.cfg.acquireConfirm - 1)
-            * (
-                self.cfg.frameSamples
-                + self.cfg.trainRadius
-            )
-        )
-
+        confirmSpan = self.cfg.guardSamples + (self.cfg.acquireConfirm - 1) * (self.cfg.frameSamples + self.cfg.trainRadius)
         if len(self.buf.data) < confirmSpan:
             return False
-
-        window = (
-            self.cfg.searchWindowFrames
-            * self.cfg.frameSamples
-        )
-
-        lo = max(
-            self.buf.base,
-            self.buf.end - window
-        )
-
+        window = self.cfg.searchWindowFrames * self.cfg.frameSamples
+        lo = max(self.buf.base, self.buf.end - window)
         hi = self.buf.end - confirmSpan
-
-        trains = self._findTrains(
-            lo,
-            hi,
-            self.cfg.acquireThreshold
-        )
-
+        trains = self._findTrains(lo, hi, self.cfg.acquireThreshold, self.cfg.acquireConfirm)
         if not trains:
             return False
-
-        # На старте берём самый ранний подтверждённый train.
-        train = min(
-            trains,
-            key=lambda t: t["pos"]
-        )
-
-        guardPos = train["pos"]
-        phase = train["phase"]
-
-        # В V1 RX запускается ДО TX.
-        # Поэтому первый найденный spinner cycle
-        # соответствует первым 0..7 frames сессии.
+        train = min(trains, key=lambda t: t['pos'])
+        guardPos = train['pos']
+        phase = train['phase']
         frameIndex = phase
-
         for n in range(frameIndex):
-            self._emit(
-                n,
-                None,
-                "lost",
-                reason="before_initial_lock"
-            )
-
+            self._emit(n, None, 'lost', reason='before_initial_lock')
         core = self._coreAt(guardPos)
-
         if core is None:
             return False
-
-        self._emit(
-            frameIndex,
-            core.copy(),
-            "ok",
-            guard_pos=guardPos,
-            corr=train["score"],
-            timing_error_samples=0.0,
-            observed_period="",
-            period_estimate=self.periodEstimate,
-            predicted_frame=frameIndex
-        )
-
+        self._emit(frameIndex, core.copy(), 'ok', guard_pos=guardPos, corr=train['score'], timing_error_samples=0.0, observed_period='', period_estimate=self.periodEstimate, predicted_frame=frameIndex)
         self.lastGuard = guardPos
         self.lastFrame = frameIndex
-
-        self._alignPredictor(
-            frameIndex,
-            guardPos,
-            hard=True
-        )
-
-        self.state = "LOCKED"
-        self.stats["acquisitions"] += 1
-
-        self._event(
-            "acquired",
-            guard_pos=guardPos,
-            frame=frameIndex,
-            spinner_phase=phase,
-            corr=train["score"]
-        )
-
+        self._alignPredictor(frameIndex, guardPos, hard=True)
+        self.state = 'LOCKED'
+        self.stats['acquisitions'] += 1
+        self._event('acquired', guard_pos=guardPos, frame=frameIndex, spinner_phase=phase, corr=train['score'])
         return True
 
+    def _findConfirmedTrackAnchor(self):
+        if self.lastGuard is None or self.lastFrame < 0:
+            return None, False
+
+        confirm = max(2, int(self.cfg.trackConfirm))
+        confirmSpan = self.cfg.guardSamples + (confirm - 1) * (self.cfg.frameSamples + self.cfg.trainRadius) + self.detectorHalf
+        lo = max(self.buf.base + self.detectorHalf, int(self.lastGuard + self.cfg.frameSamples // 2))
+        hiAvailable = self.buf.end - confirmSpan
+        hiLimit = int(self.lastGuard + (self.cfg.trackLookaheadFrames + 2) * self.cfg.frameSamples)
+
+        if hiAvailable < lo:
+            return None, True
+
+        trains = self._findTrains(lo, min(hiAvailable, hiLimit), self.cfg.trackThreshold, confirm)
+        candidates = []
+
+        for train in trains:
+            frameIndex, predicted = self._resolveFrameIndex(train["phase"], train["pos"])
+            if frameIndex is None or frameIndex <= self.lastFrame:
+                continue
+
+            logicalAdvance = frameIndex - self.lastFrame
+            if logicalAdvance > self.cfg.trackLookaheadFrames + 2:
+                continue
+
+            predictionError = abs(frameIndex - predicted)
+            if predictionError > self.cfg.maxPredictionErrorFrames:
+                continue
+
+            physicalGap = train["pos"] - self.lastGuard
+            timelineDelta = physicalGap - logicalAdvance * self.cfg.frameSamples
+
+            candidates.append({
+                "frame": frameIndex, "guard_pos": train["pos"], "corr": train["score"],
+                "min_corr": train["min_corr"], "margin": train["min_margin"],
+                "predicted": predicted, "prediction_error": predictionError,
+                "timing_error": float(timelineDelta), "timeline_delta": float(timelineDelta),
+                "chain_positions": train["positions"], "chain_corrs": train["corrs"],
+            })
+
+        searchComplete = hiAvailable >= hiLimit
+        strong = [c for c in candidates if c["min_corr"] >= self.cfg.trackStrongThreshold]
+        if strong:
+            best = max(strong, key=lambda c: (c["min_corr"], c["corr"], c["margin"], -c["prediction_error"]))
+            return best, False
+
+        if not searchComplete:
+            return None, True
+        if candidates:
+            best = min(candidates, key=lambda c: (c["prediction_error"], -c["corr"], -c["margin"]))
+            return best, False
+
+        return None, False
+
     def _track(self, final=False):
+        # Fast-path small timing errors; otherwise buffer and confirm a later anchor before recovery.
         frameIndex = self.lastFrame + 1
-
-        expectedPos = (
-            self.lastGuard
-            + self.periodEstimate
-        )
-
+        expectedPos = self.lastGuard + self.periodEstimate
         if final:
             if self.buf.end < expectedPos + self.cfg.guardSamples:
                 return False
-
-            lo = max(
-                self.buf.base,
-                expectedPos - self.cfg.trackRadius
-            )
-
-            hi = min(
-                expectedPos + self.cfg.trackRadius,
-                self.buf.end - self.cfg.guardSamples
-            )
-
+            lo = max(self.buf.base, expectedPos - self.cfg.trackRadius)
+            hi = min(expectedPos + self.cfg.trackRadius, self.buf.end - self.cfg.guardSamples)
             if hi < lo:
                 return False
-
         else:
-            needEnd = (
-                expectedPos
-                + self.cfg.trackRadius
-                + self.cfg.guardSamples
-            )
-
+            needEnd = expectedPos + self.cfg.trackRadius + self.cfg.guardSamples
             if self.buf.end < needEnd:
                 return False
-
             lo = expectedPos - self.cfg.trackRadius
             hi = expectedPos + self.cfg.trackRadius
-
-        expectedPhase = (
-            frameIndex % self.cfg.spinnerSize
-        )
-
-        expectedGuardPos, expectedCorr, expectedMargin = (
-            self._bestExpectedGuard(
-                expectedPhase,
-                lo,
-                hi
-            )
-        )
-
-        # Phase identity must be compared at ONE physical position.
-        # A speech codec can produce a strong false peak for another
-        # phase elsewhere inside ±trackRadius.
+        expectedPhase = frameIndex % self.cfg.spinnerSize
+        expectedGuardPos, expectedCorr, expectedMargin = self._bestExpectedGuard(expectedPhase, lo, hi)
         samePosPhase = None
         samePosCorr = 0.0
-
         if expectedGuardPos is not None:
-            _, samePosBank = self._bankCorrRange(
-                expectedGuardPos,
-                expectedGuardPos
-            )
-
+            _, samePosBank = self._bankCorrRange(expectedGuardPos, expectedGuardPos)
             if samePosBank is not None:
                 sameScores = samePosBank[:, 0]
                 samePosPhase = int(np.argmax(sameScores))
-                samePosCorr = float(
-                    sameScores[samePosPhase]
-                )
-
-        conflict = (
-            expectedGuardPos is not None
-            and samePosPhase is not None
-            and samePosPhase != expectedPhase
-            and samePosCorr >= self.cfg.trackThreshold
-            and (
-                samePosCorr - expectedCorr
-                >= self.cfg.phaseSwitchMargin
-            )
-        )
-
+                samePosCorr = float(sameScores[samePosPhase])
+        conflict = expectedGuardPos is not None and samePosPhase is not None and (samePosPhase != expectedPhase) and (samePosCorr >= self.cfg.trackThreshold) and (samePosCorr - expectedCorr >= self.cfg.phaseSwitchMargin)
         shiftedConfirmed = False
         nextExpectedCorr = None
         nextObservedCorr = None
         nextExpectedGuardPos = None
-
-        if conflict and not final:
-            nextExpectedPos = (
-                expectedPos
-                + self.periodEstimate
-            )
-
-            nextNeedEnd = (
-                nextExpectedPos
-                + self.cfg.trackRadius
-                + self.cfg.guardSamples
-            )
-
+        if conflict and (not final):
+            nextExpectedPos = expectedPos + self.periodEstimate
+            nextNeedEnd = nextExpectedPos + self.cfg.trackRadius + self.cfg.guardSamples
             if self.buf.end < nextNeedEnd:
                 return False
-
-            nextLo = (
-                nextExpectedPos
-                - self.cfg.trackRadius
-            )
-            nextHi = (
-                nextExpectedPos
-                + self.cfg.trackRadius
-            )
-
-            nextExpectedPhase = (
-                (expectedPhase + 1)
-                % self.cfg.spinnerSize
-            )
-            nextObservedPhase = (
-                (samePosPhase + 1)
-                % self.cfg.spinnerSize
-            )
-
-            (
-                nextExpectedGuardPos,
-                nextExpectedCorr,
-                _
-            ) = self._bestExpectedGuard(
-                nextExpectedPhase,
-                nextLo,
-                nextHi
-            )
-
+            nextLo = nextExpectedPos - self.cfg.trackRadius
+            nextHi = nextExpectedPos + self.cfg.trackRadius
+            nextExpectedPhase = (expectedPhase + 1) % self.cfg.spinnerSize
+            nextObservedPhase = (samePosPhase + 1) % self.cfg.spinnerSize
+            nextExpectedGuardPos, nextExpectedCorr, _ = self._bestExpectedGuard(nextExpectedPhase, nextLo, nextHi)
             if nextExpectedGuardPos is not None:
-                _, nextSameBank = self._bankCorrRange(
-                    nextExpectedGuardPos,
-                    nextExpectedGuardPos
-                )
-
+                _, nextSameBank = self._bankCorrRange(nextExpectedGuardPos, nextExpectedGuardPos)
                 if nextSameBank is not None:
                     nextScores = nextSameBank[:, 0]
-
-                    nextObservedCorr = float(
-                        nextScores[
-                            nextObservedPhase
-                        ]
-                    )
-
+                    nextObservedCorr = float(nextScores[nextObservedPhase])
             if nextObservedCorr is not None:
-                shiftedConfirmed = (
-                    nextObservedCorr
-                    >= self.cfg.trackThreshold
-                    and (
-                        nextObservedCorr
-                        - nextExpectedCorr
-                        >= self.cfg.phaseSwitchMargin
-                    )
-                )
-
+                shiftedConfirmed = nextObservedCorr >= self.cfg.trackThreshold and nextObservedCorr - nextExpectedCorr >= self.cfg.phaseSwitchMargin
         if conflict and shiftedConfirmed:
-            self.state = "REACQUIRE"
-            self.stats["track_misses"] += 1
-            self.stats["spinner_mismatches"] += 1
-
-            self._event(
-                "spinner_mismatch",
-                expected_frame=frameIndex,
-                expected_phase=expectedPhase,
-                expected_corr=expectedCorr,
-                expected_margin=expectedMargin,
-                observed_phase=samePosPhase,
-                guard_pos=expectedGuardPos,
-                corr=samePosCorr,
-                expected_guard_pos=expectedGuardPos,
-                expected_guard_error=(
-                    float(
-                        expectedGuardPos
-                        - expectedPos
-                    )
-                    if expectedGuardPos is not None
-                    else None
-                ),
-                observed_guard_error=(
-                    float(
-                        expectedGuardPos
-                        - expectedPos
-                    )
-                    if expectedGuardPos is not None
-                    else None
-                ),
-                next_expected_guard_pos=nextExpectedGuardPos,
-                next_expected_corr=nextExpectedCorr,
-                next_observed_corr=nextObservedCorr,
-                phase_shift_confirmed=True
-            )
-
+            self.state = 'REACQUIRE'
+            self.stats['track_misses'] += 1
+            self.stats['spinner_mismatches'] += 1
+            self._event('spinner_mismatch', expected_frame=frameIndex, expected_phase=expectedPhase, expected_corr=expectedCorr, expected_margin=expectedMargin, observed_phase=samePosPhase, guard_pos=expectedGuardPos, corr=samePosCorr, expected_guard_pos=expectedGuardPos, expected_guard_error=float(expectedGuardPos - expectedPos) if expectedGuardPos is not None else None, observed_guard_error=float(expectedGuardPos - expectedPos) if expectedGuardPos is not None else None, next_expected_guard_pos=nextExpectedGuardPos, next_expected_corr=nextExpectedCorr, next_observed_corr=nextObservedCorr, phase_shift_confirmed=True)
             return True
-
-        # Пока LOCKED, ожидаемый phase важнее конкурирующих
-        # шаблонов. Для него достаточно пройти trackThreshold.
-        if (
-            expectedGuardPos is not None
-            and expectedCorr >= self.cfg.trackThreshold
-        ):
+        candidateUsable = expectedGuardPos is not None and expectedCorr >= self.cfg.trackThreshold
+        candidateTimingError = float(expectedGuardPos - expectedPos) if expectedGuardPos is not None else None
+        candidateTrusted = candidateUsable and abs(candidateTimingError) <= self.cfg.trackContinuityRadius
+        if candidateTrusted:
             guardPos = expectedGuardPos
             corr = expectedCorr
-
         else:
-            # Один повреждённый guard можно пережить без полного
-            # REACQUIRE, если следующий ожидаемый guard уже виден.
-            if not final:
-                nextExpectedPos = (
-                    expectedPos
-                    + self.periodEstimate
-                )
-
-                nextNeedEnd = (
-                    nextExpectedPos
-                    + self.cfg.trackRadius
-                    + self.cfg.guardSamples
-                )
-
-                if self.buf.end < nextNeedEnd:
-                    return False
-
-                nextPhase = (
-                    (expectedPhase + 1)
-                    % self.cfg.spinnerSize
-                )
-
-                nextPos, nextCorr, _ = self._bestExpectedGuard(
-                    nextPhase,
-                    nextExpectedPos - self.cfg.trackRadius,
-                    nextExpectedPos + self.cfg.trackRadius
-                )
-
-                if (
-                    nextPos is not None
-                    and nextCorr >= self.cfg.trackThreshold
-                ):
-                    guardPos = int(round(expectedPos))
-
-                    wall = self._wallAt(guardPos)
-                    predictedFrame = self._predictFrame(
-                        wall
-                    )
-
-                    self._emit(
-                        frameIndex,
-                        None,
-                        "lost",
-                        guard_pos=guardPos,
-                        corr=expectedCorr,
-                        timing_error_samples=0.0,
-                        observed_period=float(
-                            self.periodEstimate
-                        ),
-                        period_estimate=float(
-                            self.periodEstimate
-                        ),
-                        predicted_frame=predictedFrame,
-                        reason="single_guard_erasure"
-                    )
-
-                    self.lastGuard = guardPos
-                    self.lastFrame = frameIndex
-
-                    self._event(
-                        "guard_erasure_holdover",
-                        frame=frameIndex,
-                        expected_phase=expectedPhase,
-                        expected_corr=expectedCorr,
-                        next_expected_corr=nextCorr
-                    )
-
-                    return True
-
-            anyPos, anyPhase, anyCorr = (
-                self._bestAnyGuard(
-                    lo,
-                    hi
-                )
-            )
-
-            self.state = "REACQUIRE"
-            self.stats["track_misses"] += 1
-
-            self._event(
-                "track_miss",
-                expected_frame=frameIndex,
-                expected_guard=expectedPos,
-                expected_phase=expectedPhase,
-                expected_corr=expectedCorr,
-                expected_margin=expectedMargin,
-                expected_guard_pos=expectedGuardPos,
-                expected_guard_error=(
-                    float(
-                        expectedGuardPos
-                        - expectedPos
-                    )
-                    if expectedGuardPos is not None
-                    else None
-                ),
-                best_phase=anyPhase,
-                best_guard_pos=anyPos,
-                best_corr=anyCorr
-            )
-
+            anchor, needMore = self._findConfirmedTrackAnchor()
+            if needMore:
+                return False
+            if anchor is not None:
+                oldFrame = self.lastFrame
+                oldGuard = self.lastGuard
+                anchorFrame = anchor['frame']
+                anchorGuard = anchor['guard_pos']
+                recovery = self._recoverGap(oldFrame=oldFrame, oldGuard=oldGuard, newFrame=anchorFrame, newGuard=anchorGuard, newGuardCorr=anchor['corr'])
+                physicalGap = anchorGuard - oldGuard
+                logicalGap = anchorFrame - oldFrame
+                timelineDelta = physicalGap - logicalGap * self.cfg.frameSamples
+                self.lastFrame = anchorFrame
+                self.lastGuard = anchorGuard
+                self._alignPredictor(anchorFrame, anchorGuard, hard=abs(timelineDelta) > self.cfg.maxTimingJump)
+                self._event('track_gap_recovered', suspect_frame=frameIndex, suspect_expected_phase=expectedPhase, suspect_corr=expectedCorr, suspect_guard_pos=expectedGuardPos, suspect_timing_error=candidateTimingError, old_frame=oldFrame, old_guard_pos=oldGuard, anchor_frame=anchorFrame, anchor_guard_pos=anchorGuard, anchor_corr=anchor['corr'], anchor_timing_error=anchor['timing_error'], confirm_positions=anchor['chain_positions'], confirm_corrs=anchor['chain_corrs'], gap_recovered=recovery['recovered'], gap_lost=recovery['lost'], detected_gap_guards=recovery['detected_guards'], estimated_gap_guards=recovery['estimated_guards'], timeline_delta_samples=timelineDelta)
+                return True
+            anyPos, anyPhase, anyCorr = self._bestAnyGuard(lo, hi)
+            self.state = 'REACQUIRE'
+            self.stats['track_misses'] += 1
+            self._event('track_miss', expected_frame=frameIndex, expected_guard=expectedPos, expected_phase=expectedPhase, expected_corr=expectedCorr, expected_margin=expectedMargin, expected_guard_pos=expectedGuardPos, expected_guard_error=candidateTimingError, best_phase=anyPhase, best_guard_pos=anyPos, best_corr=anyCorr, reason='no_confirmed_track_chain')
             return True
-
-        observedPeriod = (
-            guardPos - self.lastGuard
-        )
-
-        timingError = (
-            guardPos - expectedPos
-        )
-
+        observedPeriod = guardPos - self.lastGuard
+        timingError = guardPos - expectedPos
         wall = self._wallAt(guardPos)
         predictedFrame = self._predictFrame(wall)
-
-        core, coreCorrection = (
-            self._coreBetweenGuards(
-                guardPos
-            )
-        )
-
+        core, coreCorrection = self._coreBetweenGuards(guardPos)
         damaged = core is None
-
-        self._emit(
-            frameIndex,
-            None if damaged else core,
-            "lost" if damaged else "ok",
-            guard_pos=guardPos,
-            corr=corr,
-            timing_error_samples=float(
-                timingError
-            ),
-            observed_period=float(
-                observedPeriod
-            ),
-            period_estimate=float(
-                self.periodEstimate
-            ),
-            predicted_frame=predictedFrame,
-            core_input_samples=(
-                ""
-                if coreCorrection is None
-                else (
-                    self.cfg.coreSamples
-                    + coreCorrection
-                )
-            ),
-            core_correction_samples=(
-                ""
-                if coreCorrection is None
-                else coreCorrection
-            ),
-            reason=(
-                "core_adjust_too_large"
-                if damaged
-                else ""
-            )
-        )
-
-        if (
-            abs(
-                observedPeriod
-                - self.cfg.frameSamples
-            )
-            <= 4
-        ):
+        self._emit(frameIndex, None if damaged else core, 'lost' if damaged else 'ok', guard_pos=guardPos, corr=corr, timing_error_samples=float(timingError), observed_period=float(observedPeriod), period_estimate=float(self.periodEstimate), predicted_frame=predictedFrame, core_input_samples='' if coreCorrection is None else self.cfg.coreSamples + coreCorrection, core_correction_samples='' if coreCorrection is None else coreCorrection, reason='core_adjust_too_large' if damaged else '')
+        if abs(observedPeriod - self.cfg.frameSamples) <= 4:
             a = self.cfg.periodAlpha
-
-            self.periodEstimate = (
-                (1.0 - a)
-                * self.periodEstimate
-                + a * observedPeriod
-            )
-
+            self.periodEstimate = (1.0 - a) * self.periodEstimate + a * observedPeriod
         self.lastGuard = guardPos
         self.lastFrame = frameIndex
-
-        self._alignPredictor(
-            frameIndex,
-            guardPos,
-            hard=False
-        )
-
+        self._alignPredictor(frameIndex, guardPos, hard=False)
         return True
 
     def _reacquire(self):
-        # Не запускаем тяжёлый search после каждого
-        # крошечного PCM chunk.
-        if (
-            self.buf.end
-            - self.lastReacquireSearchEnd
-            < self.cfg.frameSamples
-        ):
+        # Reacquire with a short confirmed train, then recover the buffered gap when frame identity is reliable.
+        if self.buf.end - self.lastReacquireSearchEnd < self.cfg.frameSamples:
             return False
-
         self.lastReacquireSearchEnd = self.buf.end
-
-        confirmSpan = (
-            self.cfg.guardSamples
-            + (self.cfg.acquireConfirm - 1)
-            * (
-                self.cfg.frameSamples
-                + self.cfg.trainRadius
-            )
-        )
-
+        confirmSpan = self.cfg.guardSamples + (self.cfg.reacquireConfirm - 1) * (self.cfg.frameSamples + self.cfg.trainRadius)
         if len(self.buf.data) < confirmSpan:
             return False
-
-        window = (
-            self.cfg.searchWindowFrames
-            * self.cfg.frameSamples
-        )
-
-        lo = max(
-            self.buf.base,
-            (
-                self.lastGuard
-                + self.cfg.frameSamples // 2
-                if self.lastGuard is not None
-                else self.buf.base
-            ),
-            self.buf.end - window
-        )
-
+        window = self.cfg.searchWindowFrames * self.cfg.frameSamples
+        lo = max(self.buf.base, self.lastGuard + self.cfg.frameSamples // 2 if self.lastGuard is not None else self.buf.base, self.buf.end - window)
         hi = self.buf.end - confirmSpan
-
-        trains = self._findTrains(
-            lo,
-            hi,
-            self.cfg.acquireThreshold
-        )
-
+        trains = self._findTrains(lo, hi, self.cfg.acquireThreshold, self.cfg.reacquireConfirm)
         if not trains:
             return False
-
         candidates = []
-
         for train in trains:
-            frameIndex, predicted = (
-                self._resolveFrameIndex(
-                    train["phase"],
-                    train["pos"]
-                )
-            )
-
+            frameIndex, predicted = self._resolveFrameIndex(train['phase'], train['pos'])
             if frameIndex is None:
                 continue
-
-            predictionError = abs(
-                frameIndex - predicted
-            )
-
-            if (
-                predictionError
-                > self.cfg.maxPredictionErrorFrames
-            ):
+            predictionError = abs(frameIndex - predicted)
+            if predictionError > self.cfg.maxPredictionErrorFrames:
                 continue
-
-            candidates.append({
-                "train": train,
-                "frame": frameIndex,
-                "predicted": predicted,
-                "prediction_error": predictionError
-            })
-
+            candidates.append({'train': train, 'frame': frameIndex, 'predicted': predicted, 'prediction_error': predictionError})
         if not candidates:
             return False
-
-        # Сначала доверяем wall-clock prediction,
-        # потом силе PN train.
-        best = min(
-            candidates,
-            key=lambda c: (
-                c["prediction_error"],
-                -c["train"]["score"],
-                c["train"]["pos"]
-            )
-        )
-
-        train = best["train"]
-        frameIndex = best["frame"]
-        guardPos = train["pos"]
-
+        strong = [c for c in candidates if c["train"].get("min_corr", 0.0) >= self.cfg.trackStrongThreshold]
+        if strong:
+            best = max(strong, key=lambda c: (c["train"]["min_corr"], c["train"]["score"], c["train"]["min_margin"], -c["prediction_error"]))
+        else:
+            best = min(candidates, key=lambda c: (c["prediction_error"], -c["train"]["score"], c["train"]["pos"]))
+        train = best['train']
+        frameIndex = best['frame']
+        guardPos = train['pos']
         oldFrame = self.lastFrame
         oldGuard = self.lastGuard
-
-        # Всё между последним подтверждённым frame
-        # и новым найденным считаем потерянным.
-        for n in range(
-            oldFrame + 1,
-            frameIndex
-        ):
-            self._emit(
-                n,
-                None,
-                "lost",
-                reason="reacquire_gap"
-            )
-
-        core = self._coreAt(guardPos)
-
-        physicalGap = (
-            guardPos - oldGuard
-        )
-
-        logicalGap = (
-            frameIndex - oldFrame
-        )
-
-        recoveredDamaged = (
-            logicalGap == 1
-            and abs(
-                physicalGap
-                - self.cfg.frameSamples
-            )
-            > self.cfg.maxTimingJump
-        )
-
-        if core is None:
-            recoveredDamaged = True
-
-        self._emit(
-            frameIndex,
-            (
-                None
-                if recoveredDamaged
-                else core.copy()
-            ),
-            (
-                "lost"
-                if recoveredDamaged
-                else "ok"
-            ),
-            guard_pos=guardPos,
-            corr=train["score"],
-            timing_error_samples="",
-            observed_period="",
-            period_estimate=float(
-                self.periodEstimate
-            ),
-            predicted_frame=best["predicted"],
-            prediction_error_frames=best[
-                "prediction_error"
-            ],
-            reason=(
-                "reacquire_timing_jump"
-                if recoveredDamaged
-                else ""
-            )
-        )
-
-        # После discontinuity старый sample-rate estimate
-        # пока не тащим за собой.
-        self.periodEstimate = float(
-            self.cfg.frameSamples
-        )
-
+        physicalGap = guardPos - oldGuard
+        logicalGap = frameIndex - oldFrame
+        timingDiscontinuity = abs(physicalGap - logicalGap * self.cfg.frameSamples) > self.cfg.maxTimingJump
+        if best['prediction_error'] <= self.cfg.gapRecoveryMaxAnchorPredictionError:
+            recovery = self._recoverGap(oldFrame=oldFrame, oldGuard=oldGuard, newFrame=frameIndex, newGuard=guardPos, newGuardCorr=train['score'])
+            gapRecoveryAttempted = True
+        else:
+            for n in range(oldFrame + 1, frameIndex):
+                self._emit(n, None, 'lost', reason='reacquire_anchor_uncertain')
+            core = self._coreAt(guardPos)
+            anchorStatus = 'ok' if core is not None else 'lost'
+            self._emit(frameIndex, core.copy() if core is not None else None, anchorStatus, guard_pos=guardPos, corr=train['score'], recovered_gap=False, reason='' if anchorStatus == 'ok' else 'anchor_core_missing')
+            recoveredCount = 1 if anchorStatus == 'ok' else 0
+            recovery = {'recovered': recoveredCount, 'lost': logicalGap - recoveredCount, 'detected_guards': 0, 'estimated_guards': 0}
+            gapRecoveryAttempted = False
+        self.periodEstimate = float(self.cfg.frameSamples)
         self.lastGuard = guardPos
         self.lastFrame = frameIndex
-
-        # После подтверждённого spinner train
-        # заново точно привязываем wall predictor.
-        self._alignPredictor(
-            frameIndex,
-            guardPos,
-            hard=True
-        )
-
-        self.state = "LOCKED"
-        self.stats["reacquisitions"] += 1
-
-        self._event(
-            "reacquired",
-            guard_pos=guardPos,
-            recovered_frame=frameIndex,
-            spinner_phase=train["phase"],
-            predicted_frame=best["predicted"],
-            prediction_error_frames=best[
-                "prediction_error"
-            ],
-            skipped_frames=max(
-                0,
-                frameIndex - oldFrame - 1
-            ),
-            recovered_status=(
-                "lost"
-                if recoveredDamaged
-                else "ok"
-            )
-        )
-
+        self._alignPredictor(frameIndex, guardPos, hard=True)
+        self.state = 'LOCKED'
+        self.stats['reacquisitions'] += 1
+        self._event('reacquired', guard_pos=guardPos, recovered_frame=frameIndex, spinner_phase=train['phase'], predicted_frame=best['predicted'], prediction_error_frames=best['prediction_error'], gap_frames=max(0, frameIndex - oldFrame - 1), gap_recovery_attempted=gapRecoveryAttempted, gap_recovered=recovery['recovered'], gap_lost=recovery['lost'], detected_gap_guards=recovery['detected_guards'], estimated_gap_guards=recovery['estimated_guards'], timing_discontinuity=timingDiscontinuity)
         return True
 
     def _prune(self):
-        keep = (
-            self.cfg.searchWindowFrames
-            * self.cfg.frameSamples
-            + self.cfg.coreSamples
-            + self.cfg.trackRadius
-        )
-
-        self.buf.discardBefore(
-            max(
-                self.buf.base,
-                self.buf.end - keep
-            )
-        )
+        normalKeep = self.cfg.searchWindowFrames * self.cfg.frameSamples + self.cfg.coreSamples + self.cfg.trackRadius
+        normalStart = self.buf.end - normalKeep
+        discardBefore = normalStart
+        if self.state == 'REACQUIRE' and self.lastGuard is not None:
+            recoveryKeep = self.cfg.gapRecoveryMaxFrames * self.cfg.frameSamples + self.cfg.guardSamples + self.cfg.gapRecoveryRadius
+            capStart = self.buf.end - recoveryKeep
+            recoveryStart = self.lastGuard
+            discardBefore = max(capStart, min(normalStart, recoveryStart))
+        self.buf.discardBefore(max(self.buf.base, int(discardBefore)))
