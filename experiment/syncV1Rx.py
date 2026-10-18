@@ -32,6 +32,7 @@ def main():
     p.add_argument("--duration", type=float, default=0.0)
     p.add_argument("--rate", type=int, default=16000)
     p.add_argument("--spinner-size", type=int, default=8)
+    p.add_argument("--super-spinner-size", type=int, default=8)
     p.add_argument("--io-samples", type=int, default=160)
 
     p.add_argument(
@@ -62,6 +63,7 @@ def main():
     cfg = SyncV1Config(
         rate=args.rate,
         spinnerSize=args.spinner_size,
+        superSpinnerSize=args.super_spinner_size,
         acquireThreshold=args.acquire_threshold,
         trackThreshold=args.track_threshold
     )
@@ -87,6 +89,8 @@ def main():
         "frame",
         "status",
         "spinner_phase",
+        "super_phase",
+        "guard_code",
         "guard_pos",
         "corr",
         "timing_error_samples",
@@ -116,6 +120,8 @@ def main():
             frameIndex,
             status,
             meta.get("spinner_phase", ""),
+            meta.get("super_phase", ""),
+            meta.get("guard_code", ""),
             meta.get("guard_pos", ""),
             meta.get("corr", ""),
             meta.get("timing_error_samples", ""),
@@ -262,6 +268,8 @@ def main():
         "last_frame": sync.lastFrame,
         "period_estimate": sync.periodEstimate,
         "spinner_size": cfg.spinnerSize,
+        "super_spinner_size": cfg.superSpinnerSize,
+        "guard_cycle": sync.guardCycle,
         "recovered_wav": str(wavPath),
         "frames_csv": str(framesPath),
         "events_jsonl": str(eventsPath)

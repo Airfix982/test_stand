@@ -16,7 +16,8 @@ def generate(
     seed=4444,
     levelDbfs=-17.0,
     guardRatio=0.8,
-    spinnerSize=8
+    spinnerSize=8,
+    superSpinnerSize=8
 ):
     if rate != 16000:
         raise ValueError("SyncV1 probe currently expects 16000 Hz")
@@ -64,7 +65,7 @@ def generate(
     guards = makeGuardBank(
         rate,
         guardSamples,
-        spinnerSize
+        spinnerSize * superSpinnerSize
     )
 
     out = np.zeros(
@@ -81,7 +82,7 @@ def generate(
         )
 
         phase = (
-            frameIndex % spinnerSize
+            frameIndex % (spinnerSize * superSpinnerSize)
         )
 
         out[
@@ -128,6 +129,7 @@ def generate(
         "core_samples": coreSamples,
         "guard_samples": guardSamples,
         "spinner_size": spinnerSize,
+        "super_spinner_size": superSpinnerSize,
         "guard_ratio": guardRatio,
         "seed": seed
     }
@@ -151,6 +153,7 @@ def main():
     p.add_argument("--level", type=float, default=-17.0)
     p.add_argument("--guard-ratio", type=float, default=0.8)
     p.add_argument("--spinner-size", type=int, default=8)
+    p.add_argument("--super-spinner-size", type=int, default=8)
 
     args = p.parse_args()
 
@@ -161,7 +164,8 @@ def main():
         args.seed,
         args.level,
         args.guard_ratio,
-        args.spinner_size
+        args.spinner_size,
+        args.super_spinner_size
     )
 
 

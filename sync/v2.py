@@ -4,6 +4,9 @@ import numpy as np
 from scipy.signal import find_peaks, firwin
 # API class names stay V1-compatible; this file is the V2 implementation.
 _GUARD_SEEDS = [30015, 34260, 34763, 30724, 33147, 32761, 31392, 34460]
+_SUPER_GUARD_SEEDS = [50419, 50861, 50480, 50640, 50845, 50066, 50891, 50624, 50064, 50770, 50653, 50481, 50785, 50305, 50253, 50154, 50670, 50698, 50097, 50393, 50085, 50656, 50853, 50897, 50472, 50896, 50712, 50833, 50408, 50939, 50635, 50098, 50921, 50241, 50963, 50375, 50747, 50639, 50682, 50959, 50035, 50637, 50722, 50884, 50675, 50623, 50037, 50730, 50311, 50353, 50791, 50511, 50029, 50892, 50379, 50317]
+# 64 distinct matched PN patterns: 8 fast positions x 8 slower super-phases.
+# All 64 templates are deterministic and were greedily selected for low cross-correlation.
 
 @dataclass
 class SyncV1Config:
@@ -12,6 +15,7 @@ class SyncV1Config:
     coreSamples: int = 240
     guardSamples: int = 80
     spinnerSize: int = 8
+    superSpinnerSize: int = 8  # 1 = original 8-phase protocol; 8 = 64-state super spinner
     acquireThreshold: float = 0.28
     trackThreshold: float = 0.2
     acquireConfirm: int = 8
@@ -22,7 +26,7 @@ class SyncV1Config:
     trackConfirm: int = 3
     trackContinuityRadius: int = 16
     trackChainOffsetSpread: int = 12
-    trackLookaheadFrames: int = 8
+    trackLookaheadFrames: int = 20
     trackStrongThreshold: float = 0.70
     maxTimingJump: int = 24
     maxCoreAdjust: int = 64
@@ -37,17 +41,18 @@ class SyncV1Config:
     gapRecoveryAllowEstimated: bool = True
     gapRecoveryMaxAnchorPredictionError: float = 1.0
     wallAlpha: float = 0.08
-    searchWindowFrames: int = 16
+    searchWindowFrames: int = 32
     maxPredictionErrorFrames: float = 3.5
     codeMargin: float = 0.04
     phaseSwitchMargin: float = 0.08
 
 def makeGuardBank(rate=16000, samples=80, count=8):
-    if count < 2 or count > len(_GUARD_SEEDS):
-        raise ValueError(f'spinnerSize must be from 2 to {len(_GUARD_SEEDS)}')
+    seeds = _GUARD_SEEDS + _SUPER_GUARD_SEEDS
+    if count < 2 or count > len(seeds):
+        raise ValueError(f'guard count must be from 2 to {len(seeds)}')
     taps = firwin(31, [300, 3400], pass_zero=False, fs=rate)
     guards = []
-    for seed in _GUARD_SEEDS[:count]:
+    for seed in seeds[:count]:
         rng = np.random.default_rng(seed)
         raw = rng.choice((-1.0, 1.0), size=samples + 30)
         x = np.convolve(raw, taps, mode='same')[15:15 + samples]
@@ -100,7 +105,10 @@ class FixedGuardSyncV1:
             raise ValueError('SyncV1 currently expects 16000 Hz')
         if self.cfg.coreSamples + self.cfg.guardSamples != self.cfg.frameSamples:
             raise ValueError('coreSamples + guardSamples must equal frameSamples')
-        self.guards = makeGuardBank(self.cfg.rate, self.cfg.guardSamples, self.cfg.spinnerSize)
+        if self.cfg.spinnerSize != 8 or self.cfg.superSpinnerSize not in (1, 8):
+            raise ValueError("super-spinner requires spinnerSize=8 and superSpinnerSize=1 or 8")
+        self.guardCycle = self.cfg.spinnerSize * self.cfg.superSpinnerSize
+        self.guards = makeGuardBank(self.cfg.rate, self.cfg.guardSamples, self.guardCycle)
         self.detectorTaps = firwin(31, [300, 3400], pass_zero=False, fs=self.cfg.rate).astype(np.float32)
         self.detectorHalf = (len(self.detectorTaps) - 1) // 2
         self.detectorGuards = np.stack([np.convolve(guard, self.detectorTaps, mode='same') for guard in self.guards]).astype(np.float32)
@@ -170,12 +178,8 @@ class FixedGuardSyncV1:
             a = self.cfg.wallAlpha
             self.epochWall = (1.0 - a) * self.epochWall + a * observedEpoch
 
-    def _bankCorrRange(self, lo, hi):
+    def _bankCorrRange(self, lo, hi, codes=None):
         L = self.cfg.guardSamples
-        lo = max(int(lo), self.buf.base)
-        hi = min(int(hi), self.buf.end - L)
-        if hi < lo:
-            return (None, None)
         half = self.detectorHalf
         lo = max(int(lo), self.buf.base + half)
         hi = min(int(hi), self.buf.end - L - half)
@@ -188,12 +192,12 @@ class FixedGuardSyncV1:
         if len(x) < L:
             return (None, None)
         energy = np.sqrt(np.convolve(x * x, np.ones(L, dtype=np.float32), mode='valid'))
-        corr = []
-        for i, guard in enumerate(self.detectorGuards):
-            dots = np.correlate(x, guard, mode='valid')
-            corr.append(dots / (energy * self.detectorGuardNorms[i] + 1e-12))
-        positions = np.arange(lo, lo + len(corr[0]))
-        return (positions, np.stack(corr))
+        templates = self.detectorGuards if codes is None else self.detectorGuards[np.asarray(codes, dtype=int)]
+        norms = self.detectorGuardNorms if codes is None else self.detectorGuardNorms[np.asarray(codes, dtype=int)]
+        x = np.ascontiguousarray(x)
+        windows = np.lib.stride_tricks.as_strided(x, shape=(len(x) - L + 1, L), strides=(x.strides[0], x.strides[0]), writeable=False)
+        corr = (windows @ templates.T).T / (energy[None, :] * norms[:, None] + 1e-12)
+        return (np.arange(lo, lo + corr.shape[1]), corr)
 
     def _bestAnyGuard(self, lo, hi):
         positions, corr = self._bankCorrRange(lo, hi)
@@ -204,16 +208,18 @@ class FixedGuardSyncV1:
         return (int(positions[posIndex]), int(code), float(corr[code, posIndex]))
 
     def _bestExpectedGuard(self, code, lo, hi):
-        positions, corr = self._bankCorrRange(lo, hi)
+        positions, corr = self._bankCorrRange(lo, hi, codes=[code])
         if positions is None:
             return (None, 0.0, 0.0)
-        row = corr[code]
-        i = int(np.argmax(row))
-        value = float(row[i])
-        others = np.delete(corr[:, i], code)
-        second = float(np.max(others)) if len(others) else -1.0
-        margin = value - second
-        return (int(positions[i]), value, margin)
+        i = int(np.argmax(corr[0]))
+        value = float(corr[0, i])
+        pos = int(positions[i])
+        _, allAtPeak = self._bankCorrRange(pos, pos)
+        if allAtPeak is None:
+            return (None, 0.0, 0.0)
+        others = np.delete(allAtPeak[:, 0], code)
+        margin = value - float(np.max(others)) if len(others) else 1.0
+        return (pos, value, margin)
 
     def _findTrains(self, lo, hi, threshold, confirmCount):
         positions, corr = self._bankCorrRange(lo, hi)
@@ -238,7 +244,7 @@ class FixedGuardSyncV1:
             ok = True
             for j in range(1, confirmCount):
                 expectedPos = firstPos + j * self.cfg.frameSamples
-                expectedCode = (firstCode + j) % self.cfg.spinnerSize
+                expectedCode = (firstCode + j) % self.guardCycle
                 pos, value, margin = self._bestExpectedGuard(expectedCode, expectedPos - self.cfg.trainRadius, expectedPos + self.cfg.trainRadius)
                 if pos is None or value < threshold or margin < self.cfg.codeMargin:
                     ok = False
@@ -255,7 +261,7 @@ class FixedGuardSyncV1:
         predicted = self._predictFrame(wall)
         if predicted is None:
             return (phase, float(phase))
-        cycle = self.cfg.spinnerSize
+        cycle = self.guardCycle
         k0 = int(round((predicted - phase) / cycle))
         candidates = []
         for dk in range(-3, 4):
@@ -341,7 +347,7 @@ class FixedGuardSyncV1:
             for frameIdx in range(oldFrame + 1, newFrame):
                 alpha = (frameIdx - oldFrame) / logicalGap
                 predictedPos = oldGuard + alpha * physicalSpan
-                phase = frameIdx % self.cfg.spinnerSize
+                phase = frameIdx % self.guardCycle
                 guardPos, corr, margin = self._bestExpectedGuard(phase, predictedPos - self.cfg.gapRecoveryRadius, predictedPos + self.cfg.gapRecoveryRadius)
                 if guardPos is None or corr < self.cfg.gapRecoveryThreshold or margin < self.cfg.gapRecoveryMargin:
                     continue
@@ -428,6 +434,8 @@ class FixedGuardSyncV1:
         else:
             self.stats['frames_lost'] += 1
         meta['spinner_phase'] = frameIndex % self.cfg.spinnerSize
+        meta['super_phase'] = (frameIndex // self.cfg.spinnerSize) % self.cfg.superSpinnerSize
+        meta['guard_code'] = frameIndex % self.guardCycle
         self.onFrame(frameIndex, out, status, meta)
 
     def _event(self, name, **fields):
@@ -460,7 +468,7 @@ class FixedGuardSyncV1:
         self._alignPredictor(frameIndex, guardPos, hard=True)
         self.state = 'LOCKED'
         self.stats['acquisitions'] += 1
-        self._event('acquired', guard_pos=guardPos, frame=frameIndex, spinner_phase=phase, corr=train['score'])
+        self._event('acquired', guard_pos=guardPos, frame=frameIndex, spinner_phase=phase % self.cfg.spinnerSize, super_phase=phase // self.cfg.spinnerSize, guard_code=phase, corr=train['score'])
         return True
 
     def _findConfirmedTrackAnchor(self):
@@ -489,7 +497,8 @@ class FixedGuardSyncV1:
                 continue
 
             predictionError = abs(frameIndex - predicted)
-            if predictionError > self.cfg.maxPredictionErrorFrames:
+            limit = max(self.cfg.maxPredictionErrorFrames, 20.5) if self.cfg.superSpinnerSize > 1 and train["min_corr"] >= self.cfg.trackStrongThreshold else self.cfg.maxPredictionErrorFrames
+            if predictionError > limit:
                 continue
 
             physicalGap = train["pos"] - self.lastGuard
@@ -512,8 +521,11 @@ class FixedGuardSyncV1:
         if not searchComplete:
             return None, True
         if candidates:
-            best = min(candidates, key=lambda c: (c["prediction_error"], -c["corr"], -c["margin"]))
-            return best, False
+            # With 64 patterns, a weak chain must not override the absolute super phase.
+            conservative = [c for c in candidates if abs(c["prediction_error"]) <= self.cfg.maxPredictionErrorFrames]
+            if conservative:
+                best = min(conservative, key=lambda c: (c["prediction_error"], -c["corr"], -c["margin"]))
+                return best, False
 
         return None, False
 
@@ -534,7 +546,7 @@ class FixedGuardSyncV1:
                 return False
             lo = expectedPos - self.cfg.trackRadius
             hi = expectedPos + self.cfg.trackRadius
-        expectedPhase = frameIndex % self.cfg.spinnerSize
+        expectedPhase = frameIndex % self.guardCycle
         expectedGuardPos, expectedCorr, expectedMargin = self._bestExpectedGuard(expectedPhase, lo, hi)
         samePosPhase = None
         samePosCorr = 0.0
@@ -556,8 +568,8 @@ class FixedGuardSyncV1:
                 return False
             nextLo = nextExpectedPos - self.cfg.trackRadius
             nextHi = nextExpectedPos + self.cfg.trackRadius
-            nextExpectedPhase = (expectedPhase + 1) % self.cfg.spinnerSize
-            nextObservedPhase = (samePosPhase + 1) % self.cfg.spinnerSize
+            nextExpectedPhase = (expectedPhase + 1) % self.guardCycle
+            nextObservedPhase = (samePosPhase + 1) % self.guardCycle
             nextExpectedGuardPos, nextExpectedCorr, _ = self._bestExpectedGuard(nextExpectedPhase, nextLo, nextHi)
             if nextExpectedGuardPos is not None:
                 _, nextSameBank = self._bankCorrRange(nextExpectedGuardPos, nextExpectedGuardPos)
@@ -636,7 +648,8 @@ class FixedGuardSyncV1:
             if frameIndex is None:
                 continue
             predictionError = abs(frameIndex - predicted)
-            if predictionError > self.cfg.maxPredictionErrorFrames:
+            limit = max(self.cfg.maxPredictionErrorFrames, 20.5) if self.cfg.superSpinnerSize > 1 and train["min_corr"] >= self.cfg.trackStrongThreshold else self.cfg.maxPredictionErrorFrames
+            if predictionError > limit:
                 continue
             candidates.append({'train': train, 'frame': frameIndex, 'predicted': predicted, 'prediction_error': predictionError})
         if not candidates:
@@ -672,7 +685,7 @@ class FixedGuardSyncV1:
         self._alignPredictor(frameIndex, guardPos, hard=True)
         self.state = 'LOCKED'
         self.stats['reacquisitions'] += 1
-        self._event('reacquired', guard_pos=guardPos, recovered_frame=frameIndex, spinner_phase=train['phase'], predicted_frame=best['predicted'], prediction_error_frames=best['prediction_error'], gap_frames=max(0, frameIndex - oldFrame - 1), gap_recovery_attempted=gapRecoveryAttempted, gap_recovered=recovery['recovered'], gap_lost=recovery['lost'], detected_gap_guards=recovery['detected_guards'], estimated_gap_guards=recovery['estimated_guards'], timing_discontinuity=timingDiscontinuity)
+        self._event('reacquired', guard_pos=guardPos, recovered_frame=frameIndex, spinner_phase=train['phase'] % self.cfg.spinnerSize, super_phase=train['phase'] // self.cfg.spinnerSize, guard_code=train['phase'], predicted_frame=best['predicted'], prediction_error_frames=best['prediction_error'], gap_frames=max(0, frameIndex - oldFrame - 1), gap_recovery_attempted=gapRecoveryAttempted, gap_recovered=recovery['recovered'], gap_lost=recovery['lost'], detected_gap_guards=recovery['detected_guards'], estimated_gap_guards=recovery['estimated_guards'], timing_discontinuity=timingDiscontinuity)
         return True
 
     def _prune(self):
