@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import time
 import numpy as np
 from scipy.signal import find_peaks, firwin
+
 try:
     from scipy.fft import rfft, irfft, next_fast_len
 except ImportError:
@@ -51,6 +52,7 @@ class SyncV1Config:
     gapRecoveryMaxAnchorPredictionError: float = 1.0
     wallAlpha: float = 0.08
     searchWindowFrames: int = 32
+    acquireScanStrideSamples: int = 640  # search new PCM candidate positions every 40 ms
     maxPredictionErrorFrames: float = 3.5
     codeMargin: float = 0.04
     phaseSwitchMargin: float = 0.08
@@ -138,6 +140,8 @@ class FixedGuardSyncV1:
         self.tailIndex = 0
         self.tailWall = None
         self.lastReacquireSearchEnd = -1
+        self.lastAcquireCheckedHi = None
+        self.lastReacquireCheckedHi = None
         self.stats = {'frames_ok': 0, 'frames_lost': 0, 'acquisitions': 0, 'reacquisitions': 0, 'track_misses': 0, 'spinner_mismatches': 0}
 
     def push(self, samples, tailWall=None):
@@ -503,8 +507,16 @@ class FixedGuardSyncV1:
         if len(self.buf.data) < confirmSpan:
             return False
         window = self.cfg.searchWindowFrames * self.cfg.frameSamples
-        lo = max(self.buf.base, self.buf.end - window)
         hi = self.buf.end - confirmSpan
+        prev = self.lastAcquireCheckedHi
+        if prev is not None and hi - prev < self.cfg.acquireScanStrideSamples:
+            return False
+        lo = max(self.buf.base, self.buf.end - window, (prev + 1) if prev is not None else self.buf.base)
+        if lo > hi:
+            return False
+        # Only NEW candidate start positions. _findTrains itself includes enough
+        # future samples to confirm the full PN sequence for every candidate.
+        self.lastAcquireCheckedHi = hi
         trains = self._findTrains(lo, hi, self.cfg.acquireThreshold, self.cfg.acquireConfirm)
         if not trains:
             return False
@@ -635,6 +647,7 @@ class FixedGuardSyncV1:
             if nextObservedCorr is not None:
                 shiftedConfirmed = nextObservedCorr >= self.cfg.trackThreshold and nextObservedCorr - nextExpectedCorr >= self.cfg.phaseSwitchMargin
         if conflict and shiftedConfirmed:
+            self.lastReacquireCheckedHi = None
             self.state = 'REACQUIRE'
             self.stats['track_misses'] += 1
             self.stats['spinner_mismatches'] += 1
@@ -665,6 +678,7 @@ class FixedGuardSyncV1:
                 self._event('track_gap_recovered', suspect_frame=frameIndex, suspect_expected_phase=expectedPhase, suspect_corr=expectedCorr, suspect_guard_pos=expectedGuardPos, suspect_timing_error=candidateTimingError, old_frame=oldFrame, old_guard_pos=oldGuard, anchor_frame=anchorFrame, anchor_guard_pos=anchorGuard, anchor_corr=anchor['corr'], anchor_timing_error=anchor['timing_error'], confirm_positions=anchor['chain_positions'], confirm_corrs=anchor['chain_corrs'], gap_recovered=recovery['recovered'], gap_lost=recovery['lost'], detected_gap_guards=recovery['detected_guards'], estimated_gap_guards=recovery['estimated_guards'], timeline_delta_samples=timelineDelta)
                 return True
             anyPos, anyPhase, anyCorr = self._bestAnyGuard(lo, hi)
+            self.lastReacquireCheckedHi = None
             self.state = 'REACQUIRE'
             self.stats['track_misses'] += 1
             self._event('track_miss', expected_frame=frameIndex, expected_guard=expectedPos, expected_phase=expectedPhase, expected_corr=expectedCorr, expected_margin=expectedMargin, expected_guard_pos=expectedGuardPos, expected_guard_error=candidateTimingError, best_phase=anyPhase, best_guard_pos=anyPos, best_corr=anyCorr, reason='no_confirmed_track_chain')
@@ -693,8 +707,12 @@ class FixedGuardSyncV1:
         if len(self.buf.data) < confirmSpan:
             return False
         window = self.cfg.searchWindowFrames * self.cfg.frameSamples
-        lo = max(self.buf.base, self.lastGuard + self.cfg.frameSamples // 2 if self.lastGuard is not None else self.buf.base, self.buf.end - window)
         hi = self.buf.end - confirmSpan
+        prev = self.lastReacquireCheckedHi
+        lo = max(self.buf.base, self.lastGuard + self.cfg.frameSamples // 2 if self.lastGuard is not None else self.buf.base, self.buf.end - window, (prev + 1) if prev is not None else self.buf.base)
+        if lo > hi:
+            return False
+        self.lastReacquireCheckedHi = hi
         trains = self._findTrains(lo, hi, self.cfg.acquireThreshold, self.cfg.reacquireConfirm)
         if not trains:
             return False
@@ -740,6 +758,7 @@ class FixedGuardSyncV1:
         self.lastFrame = frameIndex
         self._alignPredictor(frameIndex, guardPos, hard=True)
         self.state = 'LOCKED'
+        self.lastReacquireCheckedHi = None
         self.stats['reacquisitions'] += 1
         self._event('reacquired', guard_pos=guardPos, recovered_frame=frameIndex, spinner_phase=train['phase'] % self.cfg.spinnerSize, super_phase=train['phase'] // self.cfg.spinnerSize, guard_code=train['phase'], predicted_frame=best['predicted'], prediction_error_frames=best['prediction_error'], gap_frames=max(0, frameIndex - oldFrame - 1), gap_recovery_attempted=gapRecoveryAttempted, gap_recovered=recovery['recovered'], gap_lost=recovery['lost'], detected_gap_guards=recovery['detected_guards'], estimated_gap_guards=recovery['estimated_guards'], timing_discontinuity=timingDiscontinuity)
         return True
