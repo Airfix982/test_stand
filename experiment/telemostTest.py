@@ -3,6 +3,7 @@ Run from project root: python3 -m experiment.telemostSuperTest --role tx|rx
 Requires analysis.telemostProbeV2 and experiment.syncV1Rx from the 8x8 release.
 """
 import argparse
+import os
 import signal
 import subprocess
 import sys
@@ -74,7 +75,12 @@ class VirtualAudio:
 
 def run_child(cmd):
     print("RUN:", " ".join(str(x) for x in cmd), flush=True)
-    child = subprocess.Popen(cmd, start_new_session=True)
+    env = dict(os.environ)
+    # Prevent BLAS oversubscription when scanning 64 PN templates on a small machine.
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    child = subprocess.Popen(cmd, start_new_session=True, env=env)
     try:
         return child.wait()
     except KeyboardInterrupt:
@@ -129,7 +135,7 @@ def main():
             print("\nTELEMOST RX: select SPEAKERS 'NearS_RX'.", flush=True)
             print("Your physical speakers will NOT be selected: the file is recorded directly from the RX virtual sink.", flush=True)
             input("PRESS ENTER to start the RX recorder (Ctrl+C to stop)... ")
-            cmd = [sys.executable, "-m", "experiment.syncV1Rx", "--source", f"{RX_SINK}.monitor", "--out", str(out), "--super-spinner-size", "8"]
+            cmd = [sys.executable, "-m", "experiment.syncV1Rx", "--source", f"{RX_SINK}.monitor", "--out", str(out), "--super-spinner-size", "8", "--perf-interval", "10"]
             result = run_child(cmd)
             print(f"RX exit code: {result}", flush=True)
             if result != 0:

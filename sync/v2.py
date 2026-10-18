@@ -2,6 +2,15 @@ from dataclasses import dataclass
 import time
 import numpy as np
 from scipy.signal import find_peaks, firwin
+try:
+    from scipy.fft import rfft, irfft, next_fast_len
+except ImportError:
+    from numpy.fft import rfft, irfft
+    try:
+        from scipy.fftpack import next_fast_len
+    except ImportError:
+        def next_fast_len(n):
+            return 1 << (int(n) - 1).bit_length()
 # API class names stay V1-compatible; this file is the V2 implementation.
 _GUARD_SEEDS = [30015, 34260, 34763, 30724, 33147, 32761, 31392, 34460]
 _SUPER_GUARD_SEEDS = [50419, 50861, 50480, 50640, 50845, 50066, 50891, 50624, 50064, 50770, 50653, 50481, 50785, 50305, 50253, 50154, 50670, 50698, 50097, 50393, 50085, 50656, 50853, 50897, 50472, 50896, 50712, 50833, 50408, 50939, 50635, 50098, 50921, 50241, 50963, 50375, 50747, 50639, 50682, 50959, 50035, 50637, 50722, 50884, 50675, 50623, 50037, 50730, 50311, 50353, 50791, 50511, 50029, 50892, 50379, 50317]
@@ -45,6 +54,10 @@ class SyncV1Config:
     maxPredictionErrorFrames: float = 3.5
     codeMargin: float = 0.04
     phaseSwitchMargin: float = 0.08
+    # Discontinuities <=24 physical frames are in scope; 64-frame global slips are not.
+    maxAnchorDiscontinuityFrames: int = 24
+    # A weak chain must agree with physical sample timing before it can update frameIndex.
+    minWideAnchorCorr: float = 0.38
 
 def makeGuardBank(rate=16000, samples=80, count=8):
     seeds = _GUARD_SEEDS + _SUPER_GUARD_SEEDS
@@ -113,6 +126,7 @@ class FixedGuardSyncV1:
         self.detectorHalf = (len(self.detectorTaps) - 1) // 2
         self.detectorGuards = np.stack([np.convolve(guard, self.detectorTaps, mode='same') for guard in self.guards]).astype(np.float32)
         self.detectorGuardNorms = np.linalg.norm(self.detectorGuards, axis=1)
+        self._fftBankCache = {}
         self.onFrame = onFrame or (lambda *args: None)
         self.onEvent = onEvent or (lambda *args: None)
         self.buf = _SampleBuffer()
@@ -188,16 +202,41 @@ class FixedGuardSyncV1:
         raw = self.buf.slice(lo - half, hi + half + L)
         if raw is None:
             return (None, None)
-        x = np.convolve(raw, self.detectorTaps, mode='valid')
+        x = np.ascontiguousarray(np.convolve(raw, self.detectorTaps, mode='valid'), dtype=np.float32)
         if len(x) < L:
             return (None, None)
-        energy = np.sqrt(np.convolve(x * x, np.ones(L, dtype=np.float32), mode='valid'))
-        templates = self.detectorGuards if codes is None else self.detectorGuards[np.asarray(codes, dtype=int)]
-        norms = self.detectorGuardNorms if codes is None else self.detectorGuardNorms[np.asarray(codes, dtype=int)]
-        x = np.ascontiguousarray(x)
-        windows = np.lib.stride_tricks.as_strided(x, shape=(len(x) - L + 1, L), strides=(x.strides[0], x.strides[0]), writeable=False)
-        corr = (windows @ templates.T).T / (energy[None, :] * norms[:, None] + 1e-12)
-        return (np.arange(lo, lo + corr.shape[1]), corr)
+        # A cumulative sum is much cheaper than convolving an 80-tap rectangle.
+        power = np.concatenate(([0.0], np.cumsum(x.astype(np.float64) ** 2)))
+        energy = np.sqrt(np.maximum(0.0, power[L:] - power[:-L])).astype(np.float32)
+        ix = np.arange(self.guardCycle) if codes is None else np.asarray(codes, dtype=int)
+        templates = self.detectorGuards[ix]
+        norms = self.detectorGuardNorms[ix]
+        npositions = len(x) - L + 1
+
+        if npositions >= 320 and len(ix) >= 16:
+            # One vectorized FFT bank pass replaces 64 x sliding-window dot products.
+            nfft = next_fast_len(len(x) + L - 1)
+            cacheKey = (nfft, tuple(int(i) for i in ix))
+            spectrumBank = self._fftBankCache.get(cacheKey)
+            if spectrumBank is None:
+                spectrumBank = rfft(templates[:, ::-1].copy(), n=nfft, axis=1)
+                if len(self._fftBankCache) >= 6:
+                    self._fftBankCache.clear()
+                self._fftBankCache[cacheKey] = spectrumBank
+            fx = rfft(x, n=nfft)
+            corrNumerator = irfft(spectrumBank * fx[np.newaxis, :], n=nfft, axis=1)[:, L - 1:L - 1 + npositions]
+        else:
+            strides = (x.strides[0], x.strides[0])
+            windows = np.lib.stride_tricks.as_strided(x, shape=(npositions, L), strides=strides, writeable=False)
+            corrNumerator = (windows @ templates.T).T
+
+        # FFT roundoff over true silence must NEVER create fake correlations > 1.
+        # A mathematical normalized correlation lives in [-1, 1].
+        denominator = energy[np.newaxis, :] * norms[:, np.newaxis]
+        corr = np.zeros_like(corrNumerator, dtype=np.float32)
+        np.divide(corrNumerator, denominator, out=corr, where=denominator > 1e-5)
+        np.clip(corr, -1.0, 1.0, out=corr)
+        return np.arange(lo, lo + npositions), corr
 
     def _bestAnyGuard(self, lo, hi):
         positions, corr = self._bankCorrRange(lo, hi)
@@ -222,56 +261,72 @@ class FixedGuardSyncV1:
         return (pos, value, margin)
 
     def _findTrains(self, lo, hi, threshold, confirmCount):
-        positions, corr = self._bankCorrRange(lo, hi)
+        # Compute all positions, including confirmation frames, in ONE correlation pass.
+        # The old implementation recomputed a full 64-template bank for every candidate.
+        lo, hi = int(lo), int(hi)
+        extra = (confirmCount - 1) * self.cfg.frameSamples + self.cfg.trainRadius
+        positions, corr = self._bankCorrRange(lo, hi + extra)
         if positions is None:
             return []
-        bestCorr = np.max(corr, axis=0)
-        bestCode = np.argmax(corr, axis=0)
+        allowed = int(np.searchsorted(positions, hi, side='right'))
+        if allowed < 3:
+            return []
+        bestCorr = np.max(corr[:, :allowed], axis=0)
+        bestCode = np.argmax(corr[:, :allowed], axis=0)
         peaks, _ = find_peaks(bestCorr, height=threshold, distance=max(20, self.cfg.guardSamples // 2))
         trains = []
+        firstPosition = int(positions[0])
+        radius = self.cfg.trainRadius
         for peak in peaks:
             firstPos = int(positions[peak])
             firstCode = int(bestCode[peak])
             firstValue = float(bestCorr[peak])
-            column = corr[:, peak]
-            others = np.delete(column, firstCode)
-            firstMargin = firstValue - float(np.max(others))
+            firstColumn = corr[:, peak]
+            firstMargin = firstValue - float(max(np.max(firstColumn[:firstCode], initial=-1.0), np.max(firstColumn[firstCode + 1:], initial=-1.0)))
             if firstMargin < self.cfg.codeMargin:
                 continue
-            values = [firstValue]
-            margins = [firstMargin]
-            positionsFound = [firstPos]
-            ok = True
+            values, margins, positionsFound = [firstValue], [firstMargin], [firstPos]
             for j in range(1, confirmCount):
                 expectedPos = firstPos + j * self.cfg.frameSamples
                 expectedCode = (firstCode + j) % self.guardCycle
-                pos, value, margin = self._bestExpectedGuard(expectedCode, expectedPos - self.cfg.trainRadius, expectedPos + self.cfg.trainRadius)
-                if pos is None or value < threshold or margin < self.cfg.codeMargin:
-                    ok = False
+                left = max(0, expectedPos - radius - firstPosition)
+                right = min(corr.shape[1], expectedPos + radius + 1 - firstPosition)
+                if left >= right:
                     break
-                positionsFound.append(pos)
+                column = corr[expectedCode, left:right]
+                local = int(np.argmax(column))
+                ix = left + local
+                value = float(column[local])
+                scores = corr[:, ix]
+                margin = value - float(max(np.max(scores[:expectedCode], initial=-1.0), np.max(scores[expectedCode + 1:], initial=-1.0)))
+                if value < threshold or margin < self.cfg.codeMargin:
+                    break
+                positionsFound.append(int(positions[ix]))
                 values.append(value)
                 margins.append(margin)
-            if ok:
-                trains.append({'pos': firstPos, 'phase': firstCode, 'score': float(np.mean(values)), 'min_margin': float(np.min(margins)), 'positions': positionsFound, 'corrs': [float(v) for v in values], 'min_corr': float(np.min(values))})
+            if len(values) == confirmCount:
+                trains.append({'pos': firstPos, 'phase': firstCode, 'score': float(np.mean(values)), 'min_margin': float(min(margins)), 'positions': positionsFound, 'corrs': values, 'min_corr': float(min(values))})
         return trains
 
     def _resolveFrameIndex(self, phase, guardPos):
-        wall = self._wallAt(guardPos)
-        predicted = self._predictFrame(wall)
-        if predicted is None:
-            return (phase, float(phase))
+        # FRAME ID MUST BE DERIVED FROM PHYSICAL PCM SAMPLES, NOT time.monotonic().
+        # Wall-clock prediction can drift by seconds when the Python receiver lags.
+        # 64-state phase then disambiguates +/-8 or +/-16 jumps around that estimate.
+        if self.lastGuard is None or self.lastFrame < 0:
+            return int(phase), float(phase)
+        advance = (guardPos - self.lastGuard) / self.periodEstimate
+        predicted = self.lastFrame + advance
         cycle = self.guardCycle
-        k0 = int(round((predicted - phase) / cycle))
-        candidates = []
-        for dk in range(-3, 4):
-            n = phase + (k0 + dk) * cycle
-            if n > self.lastFrame:
-                candidates.append(n)
-        if not candidates:
-            return (None, predicted)
-        best = min(candidates, key=lambda n: abs(n - predicted))
-        return (int(best), float(predicted))
+        k = int(round((predicted - phase) / cycle))
+        candidates = [phase + (k + dk) * cycle for dk in (-1, 0, 1)]
+        valid = [n for n in candidates if n > self.lastFrame]
+        if not valid:
+            return None, float(predicted)
+        best = min(valid, key=lambda n: (abs(n - predicted), n))
+        # Never mistake another 64-frame revolution for a justified timeline jump.
+        if abs(best - predicted) > self.cfg.maxAnchorDiscontinuityFrames:
+            return None, float(predicted)
+        return int(best), float(predicted)
 
     def _coreAt(self, guardPos):
         return self.buf.slice(guardPos - self.cfg.coreSamples, guardPos)
@@ -497,7 +552,7 @@ class FixedGuardSyncV1:
                 continue
 
             predictionError = abs(frameIndex - predicted)
-            limit = max(self.cfg.maxPredictionErrorFrames, 20.5) if self.cfg.superSpinnerSize > 1 and train["min_corr"] >= self.cfg.trackStrongThreshold else self.cfg.maxPredictionErrorFrames
+            limit = self.cfg.maxAnchorDiscontinuityFrames if train["min_corr"] >= self.cfg.minWideAnchorCorr else self.cfg.maxPredictionErrorFrames
             if predictionError > limit:
                 continue
 
@@ -515,14 +570,15 @@ class FixedGuardSyncV1:
         searchComplete = hiAvailable >= hiLimit
         strong = [c for c in candidates if c["min_corr"] >= self.cfg.trackStrongThreshold]
         if strong:
-            best = max(strong, key=lambda c: (c["min_corr"], c["corr"], c["margin"], -c["prediction_error"]))
+            # Prioritize the physically plausible anchor; corr is a tie-breaker.
+            best = min(strong, key=lambda c: (c["prediction_error"], -c["min_corr"], -c["corr"]))
             return best, False
 
         if not searchComplete:
             return None, True
         if candidates:
             # With 64 patterns, a weak chain must not override the absolute super phase.
-            conservative = [c for c in candidates if abs(c["prediction_error"]) <= self.cfg.maxPredictionErrorFrames]
+            conservative = [c for c in candidates if c["prediction_error"] <= self.cfg.maxAnchorDiscontinuityFrames and c["min_corr"] >= self.cfg.minWideAnchorCorr or c["prediction_error"] <= self.cfg.maxPredictionErrorFrames]
             if conservative:
                 best = min(conservative, key=lambda c: (c["prediction_error"], -c["corr"], -c["margin"]))
                 return best, False
@@ -648,7 +704,7 @@ class FixedGuardSyncV1:
             if frameIndex is None:
                 continue
             predictionError = abs(frameIndex - predicted)
-            limit = max(self.cfg.maxPredictionErrorFrames, 20.5) if self.cfg.superSpinnerSize > 1 and train["min_corr"] >= self.cfg.trackStrongThreshold else self.cfg.maxPredictionErrorFrames
+            limit = self.cfg.maxAnchorDiscontinuityFrames if train["min_corr"] >= self.cfg.minWideAnchorCorr else self.cfg.maxPredictionErrorFrames
             if predictionError > limit:
                 continue
             candidates.append({'train': train, 'frame': frameIndex, 'predicted': predicted, 'prediction_error': predictionError})
@@ -656,7 +712,7 @@ class FixedGuardSyncV1:
             return False
         strong = [c for c in candidates if c["train"].get("min_corr", 0.0) >= self.cfg.trackStrongThreshold]
         if strong:
-            best = max(strong, key=lambda c: (c["train"]["min_corr"], c["train"]["score"], c["train"]["min_margin"], -c["prediction_error"]))
+            best = min(strong, key=lambda c: (c["prediction_error"], -c["train"]["min_corr"], -c["train"]["score"]))
         else:
             best = min(candidates, key=lambda c: (c["prediction_error"], -c["train"]["score"], c["train"]["pos"]))
         train = best['train']
