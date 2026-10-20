@@ -2,7 +2,15 @@ from dataclasses import dataclass
 import time
 import numpy as np
 from scipy.signal import find_peaks, firwin
-from scipy.fft import rfft, irfft, next_fast_len
+try:
+    from scipy.fft import rfft, irfft, next_fast_len
+except ImportError:
+    from numpy.fft import rfft, irfft
+    try:
+        from scipy.fftpack import next_fast_len
+    except ImportError:
+        def next_fast_len(n):
+            return 1 << (int(n) - 1).bit_length()
 # API class names stay V1-compatible; this file is the V2 implementation.
 _GUARD_SEEDS = [30015, 34260, 34763, 30724, 33147, 32761, 31392, 34460]
 _SUPER_GUARD_SEEDS = [50419, 50861, 50480, 50640, 50845, 50066, 50891, 50624, 50064, 50770, 50653, 50481, 50785, 50305, 50253, 50154, 50670, 50698, 50097, 50393, 50085, 50656, 50853, 50897, 50472, 50896, 50712, 50833, 50408, 50939, 50635, 50098, 50921, 50241, 50963, 50375, 50747, 50639, 50682, 50959, 50035, 50637, 50722, 50884, 50675, 50623, 50037, 50730, 50311, 50353, 50791, 50511, 50029, 50892, 50379, 50317]
