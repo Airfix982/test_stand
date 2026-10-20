@@ -193,12 +193,12 @@ def rx(args,out):
 
 
 def main():
-    p=argparse.ArgumentParser(description='LIVE speech A/B/C proof: cipher, correct index, wrong +64 index; NOT secure encryption')
+    p=argparse.ArgumentParser(description='HARD-index A/B/C proof: cipher, correct index, wrong +64 index; NOT secure encryption')
     p.add_argument('--role',choices=['tx','rx'],required=True)
     p.add_argument('--out',required=True)
     p.add_argument('--key-file',required=True,help='SAME binary key on TX and RX; >=16 bytes')
     p.add_argument('--session',default='voiceproof-1',help='Same TX/RX session')
-    p.add_argument('--grain',type=int,default=80,help='PCM chunk samples: 80 (Opus-friendly) or 40 (strong scrambling)')
+    p.add_argument('--grain',type=int,default=1,help='Scramble 1 sample at a time (strongest); use 2 or 5 if Telemost suppresses the signal')
     p.add_argument('--wrong-offset',type=int,default=64,help='Only wrong RX branch uses this added absolute frame index')
     p.add_argument('--input',help='TX offline mono WAV, optional')
     p.add_argument('--generate-only',action='store_true',help='TX only: output WAV instead of starting Telemost')

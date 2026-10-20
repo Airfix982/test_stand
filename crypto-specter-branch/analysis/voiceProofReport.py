@@ -51,6 +51,20 @@ def best_lag(ref,got,search_samples=16000*2):
     return int(l[lo+int(np.argmax(c[lo:hi]))])
 
 
+def spectral_flatness(path, frame=320):
+    """Median per-frame spectral flatness, 0 = tonal, 1 = white-noise-like."""
+    x=read_mono(path)
+    n=len(x)//frame
+    if n<1:return None
+    blocks=x[:n*frame].reshape(n,frame)
+    rms=np.sqrt(np.mean(blocks**2,axis=1))
+    active=blocks[rms>0.01]
+    if not len(active):return None
+    ps=np.abs(np.fft.rfft(active*np.hanning(frame)[None,:],axis=1))**2
+    sf=np.exp(np.mean(np.log(ps+1e-16),axis=1))/np.mean(ps+1e-16,axis=1)
+    return round(float(np.median(sf)),5)
+
+
 def main():
     p=argparse.ArgumentParser(description='Absolute-frame and A/B/C audio diagnostic')
     p.add_argument('--rx-dir',required=True)
@@ -64,7 +78,7 @@ def main():
     indices=[int(row['frame']) for row in frames]
     ok=[int(row['frame']) for row in frames if row['status']=='ok']
     index_gaps=[(a,b) for a,b in zip(indices,indices[1:]) if b!=a+1]
-    info={'frames_output':len(frames),'frames_ok':len(ok),'frames_lost':len(frames)-len(ok),
+    info={'spectral_flatness_median':{k:spectral_flatness(root/f) for k,f in FILES.items()},'frames_output':len(frames),'frames_ok':len(ok),'frames_lost':len(frames)-len(ok),
           'first_index':indices[0] if indices else None,'last_index':indices[-1] if indices else None,
           'nonconsecutive_indices':index_gaps[:10]}
     summary_path=root/'summary.json'

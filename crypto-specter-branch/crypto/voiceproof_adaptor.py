@@ -4,8 +4,8 @@ NOT cryptographically secure voice encryption. Audio cipher is intentionally
 chosen for perceptual A/B tests across speech codecs, not confidentiality.
 
 Wire payload: 320 float PCM samples @16k. No change to PN or TimePack.
-Each frame has a separately derived, deterministic chunk permutation plus
-chunk reversal and sign inversion based on master key, session and frame index.
+Each frame has a separately derived, deterministic sample permutation (grain=1 by default) plus
+independent polarity inversion based on master key, session and frame index.
 """
 import hashlib
 import hmac
@@ -16,17 +16,17 @@ from crypto.frame_port import FrameCryptoPlugin, FrameContext, FRAME, check_batc
 
 
 class VoiceProofAdaptor(FrameCryptoPlugin):
-    name = 'voiceproof_scramble_test_NOT_SECURE'
+    name = 'voiceproof_hard_sample_scramble_test_NOT_SECURE'
     encode_batch_size = 4
 
-    def __init__(self, key_file, session='voiceproof-1', grain=80, index_offset=0):
+    def __init__(self, key_file, session='voiceproof-1', grain=1, index_offset=0):
         self.key = Path(key_file).read_bytes()
         if len(self.key) < 16:
             raise ValueError('Use a shared binary key with at least 16 bytes')
         self.session = session.encode('utf-8')
         self.grain = int(grain)
         if FRAME % self.grain or self.grain <= 0 or self.grain >= FRAME:
-            raise ValueError('grain must evenly divide 320 and be < 320 (recommended 40 or 80)')
+            raise ValueError('grain must evenly divide 320 and be < 320 (recommended 1 for unambiguous speech test)')
         self.index_offset = int(index_offset)
         self._cache_index = None
         self._cache_plan = None
@@ -45,24 +45,27 @@ class VoiceProofAdaptor(FrameCryptoPlugin):
         return plan
 
     def _scramble(self, samples, frame_index):
+        """Invertible per-frame sample permutation; optimized vectorized path."""
         x = check_frame(samples).reshape(-1, self.grain)
         perm, reverse, signs = self._plan(frame_index)
-        y = np.empty_like(x)
-        for slot, src in enumerate(perm):
-            piece = x[src]
-            if reverse[slot]: piece = piece[::-1]
-            y[slot] = -piece if signs[slot] else piece
+        y = x[perm].copy()
+        if np.any(reverse) and self.grain > 1:
+            y[reverse.astype(bool)] = y[reverse.astype(bool), ::-1]
+        if np.any(signs):
+            y[signs.astype(bool)] *= -1.0
         return y.reshape(FRAME)
 
     def _descramble(self, samples, frame_index):
         x = check_frame(samples).reshape(-1, self.grain)
         perm, reverse, signs = self._plan(frame_index)
-        y = np.empty_like(x)
-        for slot, src in enumerate(perm):
-            piece = x[slot]
-            if signs[slot]: piece = -piece
-            y[src] = piece[::-1] if reverse[slot] else piece
-        return y.reshape(FRAME)
+        y = x.copy()
+        if np.any(signs):
+            y[signs.astype(bool)] *= -1.0
+        if np.any(reverse) and self.grain > 1:
+            y[reverse.astype(bool)] = y[reverse.astype(bool), ::-1]
+        out = np.empty_like(y)
+        out[perm] = y
+        return out.reshape(FRAME)
 
     def encode_batch(self, frames, indices):
         x = check_batch(frames, indices)

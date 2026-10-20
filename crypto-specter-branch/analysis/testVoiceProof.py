@@ -25,23 +25,25 @@ def wavread(path):
         return np.frombuffer(w.readframes(w.getnframes()),dtype='<i2').astype(np.float32)/32768
 
 def run_pcm(x,correct,wrong):
-    received={};statuses={};events=[]
+    received={};received_wrong={};statuses={};events=[]
     def on_frame(index,payload,status,meta):
-        received[index]=correct.decode_frame(np.asarray(payload)[:320] if status=='ok' else None,FrameContext(index,status))
+        frame=np.asarray(payload)[:320] if status=='ok' else None
+        received[index]=correct.decode_frame(frame,FrameContext(index,status))
+        received_wrong[index]=wrong.decode_frame(frame,FrameContext(index,status))
         statuses[index]=status
     def on_event(ev):events.append(ev)
     cfg=SyncV1Config(rate=20000,frameSamples=400,coreSamples=320,guardSamples=80,spinnerSize=8,superSpinnerSize=8)
     rx=FixedGuardSyncV1(cfg,on_frame,on_event)
     for j in range(0,len(x),200):rx.push(x[j:j+200],None)
     rx.finish()
-    return received,statuses,rx.stats
+    return received,received_wrong,statuses,rx.stats
 
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         key=Path(tmp)/'key';key.write_bytes(bytes(range(32)))
-        a=VoiceProofAdaptor(key,session='test',grain=80)
-        b=VoiceProofAdaptor(key,session='test',grain=80)
-        wrong=VoiceProofAdaptor(key,session='test',grain=80,index_offset=64)
+        a=VoiceProofAdaptor(key,session='test',grain=1)
+        b=VoiceProofAdaptor(key,session='test',grain=1)
+        wrong=VoiceProofAdaptor(key,session='test',grain=1,index_offset=64)
         rng=np.random.default_rng(123)
         n=160
         t=np.arange(n*320)/16000
@@ -57,11 +59,11 @@ def main():
         print('PASS exact clean 320 PCM and wrong (+64) is different')
         bank=makeGuardBank(20000,80,64)
         wire=np.concatenate([np.concatenate((enc[i]*.75,bank[i%64]*.12)) for i in range(n)]).astype(np.float32)
-        got,status,stats=run_pcm(wire,b,wrong)
+        got,wrong_got,status,stats=run_pcm(wire,b,wrong)
         assert len(got)==n and all(s=='ok' for s in status.values()) and stats['frames_lost']==0
         print('PASS TimePack 8x8 clean, %d frames' % n)
         drop=np.concatenate((wire[:50*400],wire[(50+8)*400:]))
-        got,status,stats=run_pcm(drop,b,wrong)
+        got,wrong_got,status,stats=run_pcm(drop,b,wrong)
         assert len(got)==n and sum(s=='lost' for s in status.values())==8 and stats['frames_lost']==8 and max(got)==n-1
         print('PASS dropped 8 transport frames, no persistent key/epoch shift')
         if shutil.which('ffmpeg'):
@@ -69,12 +71,16 @@ def main():
             wavwrite(src,wire,20000)
             subprocess.run(['ffmpeg','-y','-hide_banner','-loglevel','error','-i',str(src),'-ar','48000','-ac','1','-c:a','libopus','-application','voip','-b:a','48k',str(opus)],check=True)
             subprocess.run(['ffmpeg','-y','-hide_banner','-loglevel','error','-i',str(opus),'-ar','20000','-ac','1','-c:a','pcm_s16le',str(out)],check=True)
-            got,status,stats=run_pcm(wavread(out),b,wrong)
+            got,wrong_got,status,stats=run_pcm(wavread(out),b,wrong)
             assert stats['frames_lost']==0 and len(got)==n
             good=np.concatenate([got[i] for i in range(n)])
             corr=np.corrcoef(signal.ravel(),good)[0,1]
-            assert corr>.4, 'Opus destroyed decoded payload: %f' % corr
-            print('PASS Opus 48k, all %d frames, correct Pearson %.3f' % (n,corr))
+            assert corr>.55, 'Opus destroyed decoded payload: %f' % corr
+            wrong_audio=np.concatenate([wrong_got[i] for i in range(n)])
+            wrong_corr=np.corrcoef(signal.ravel(),wrong_audio)[0,1]
+            assert abs(wrong_corr)<.15, 'WRONG +64 unexpectedly resembles original: %f' % wrong_corr
+            assert corr-abs(wrong_corr)>.45, 'correct/wrong distinction insufficient'
+            print('PASS Opus 48k, all %d frames, correct Pearson %.3f, WRONG(+64) %.3f' % (n,corr,wrong_corr))
         else:print('SKIP Opus (ffmpeg missing)')
         print('ALL VOICEPROOF TESTS PASSED')
 
