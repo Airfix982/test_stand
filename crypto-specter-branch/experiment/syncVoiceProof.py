@@ -10,6 +10,7 @@ NOT A SECURE ENCRYPTION ALGORITHM. Diagnostic sample permutation ONLY.
 import argparse
 import audioop
 import csv
+import contextlib
 import hashlib
 import hmac
 import json
@@ -27,6 +28,7 @@ import numpy as np
 
 RATE, WIRE_RATE, FRAME, GUARD, SAMPLES = 16000, 20000, 320, 80, 400
 LOOP_SINK = 'nears_sync_proof'
+TELEMOST_TX_SINK, TELEMOST_RX_SINK = 'tx_enc_sink', 'rx_sink'
 
 
 def pactl(*args):
@@ -37,7 +39,7 @@ def default(kind):
     field = 'Default Source:' if kind == 'sources' else 'Default Sink:'
     names = [line.split()[1] for line in pactl('list', 'short', kind).splitlines() if len(line.split()) >= 2]
     info = next((s.split(':', 1)[1].strip() for s in pactl('info').splitlines() if s.startswith(field)), '')
-    allowed = [x for x in names if not x.endswith('.monitor') and not x.startswith('nears_') and x != LOOP_SINK]
+    allowed = [x for x in names if not x.endswith('.monitor') and not x.startswith('nears_') and x not in (LOOP_SINK, TELEMOST_TX_SINK, TELEMOST_RX_SINK, 'tx_mic')]
     if info in allowed: return info
     preferred = ['alsa_input.', 'bluez_input.'] if kind == 'sources' else ['alsa_output.', 'bluez_output.']
     return next((x for x in allowed if x.startswith(tuple(preferred))), allowed[0] if allowed else None)
@@ -133,19 +135,27 @@ def check(args):
     return key
 
 
+def transport_sink(args):
+    if args.transport == 'telemost':
+        return TELEMOST_TX_SINK if args.role == 'tx' else TELEMOST_RX_SINK
+    return LOOP_SINK
+
+
 def live_tx(args):
     source = require(args.mic_source or default('sources'), 'sources')
-    if args.transport == 'pulse':
-        if not any(x.split()[1] == LOOP_SINK for x in pactl('list', 'short', 'sinks').splitlines() if len(x.split()) >= 2):
-            raise RuntimeError('Start RX --transport pulse FIRST: virtual sink does not exist')
+    if args.transport in ('pulse','telemost'):
+        tx_sink=transport_sink(args)
+        if not any(x.split()[1] == tx_sink for x in pactl('list', 'short', 'sinks').splitlines() if len(x.split()) >= 2):
+            raise RuntimeError('TX output virtual sink does not exist: %s' % tx_sink)
     key = check(args); cipher = ProofCipher(key, args.session); bank = guards()
     outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
     capture = subprocess.Popen(['parec', '--raw', '--format=s16le', '--rate=16000', '--channels=1',
                                 '--latency-msec=40', '--device=' + source], stdout=subprocess.PIPE, bufsize=0)
+    if args.transport=='telemost': args.telemost_capture=capture
     sink = None; udp = None
-    if args.transport == 'pulse':
+    if args.transport in ('pulse','telemost'):
         sink = subprocess.Popen(['paplay', '--raw', '--format=s16le', '--rate=20000', '--channels=1',
-                                 '--device=' + LOOP_SINK], stdin=subprocess.PIPE, bufsize=0)
+                                 '--device=' + transport_sink(args)], stdin=subprocess.PIPE, bufsize=0)
     else:
         if not args.host: raise RuntimeError('TX --transport udp requires --host RX_IP')
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -153,12 +163,14 @@ def live_tx(args):
     print('[TX] physical microphone:', source, '| transport:', args.transport, '| session:', args.session, flush=True)
     print('[TX] No index or crypto metadata is sent: only 400 audio samples per frame.', flush=True)
     wf = make_wav(outdir/'tx_original_voice_16k.wav', RATE)
+    wire_w = make_wav(outdir/'tx_encrypted_20k.wav', WIRE_RATE) if args.transport == 'telemost' else None
     try:
-        while args.duration == 0 or time.monotonic() - started < args.duration:
+        while not getattr(args, 'telemost_stop', threading.Event()).is_set() and (args.duration == 0 or time.monotonic() - started < args.duration):
             data = read_exact(capture.stdout, FRAME * 2)
             if len(data) != FRAME * 2: break
             inp = pcm(data)
             packet = s16(make_frame(cipher, bank, inp, n, args.tx_gain, args.guard_amp))
+            if wire_w: wire_w.writeframes(packet)
             if udp:
                 if args.codec == 'ulaw': packet = audioop.lin2ulaw(packet, 2)
                 udp.sendto(packet, (args.host, args.port))
@@ -172,6 +184,7 @@ def live_tx(args):
         print('[TX] stopped',flush=True)
     finally:
         wf.close()
+        if wire_w:wire_w.close()
         if udp: udp.close()
         if sink:
             try:sink.stdin.close()
@@ -193,12 +206,13 @@ def live_rx(args):
     correct = ProofCipher(key, args.session)
     wrong = ProofCipher(key, args.session)
     outdir = Path(args.out);outdir.mkdir(parents=True,exist_ok=True)
-    module=None;capture=None;sock=None;player=None
+    module=None;capture=None;sock=None;player=None;sync=None
     mode = {'value': args.mode};stop = threading.Event()
     numbers = {'frames':0,'ok':0,'lost':0,'last':None,'first':None,'resets':0}
     w_cipher=make_wav(outdir/'rx_cipher_16k.wav',RATE)
     w_correct=make_wav(outdir/'rx_correct_16k.wav',RATE)
     w_wrong=make_wav(outdir/'rx_wrong_16k.wav',RATE)
+    w_wire=make_wav(outdir/'rx_received_20k.wav',WIRE_RATE) if args.transport=='telemost' else None
     csvfile=(outdir/'frames.csv').open('w',newline='')
     events=(outdir/'events.jsonl').open('w')
     writer=csv.writer(csvfile);writer.writerow(['index','status','guard_pos','corr'])
@@ -209,12 +223,19 @@ def live_rx(args):
             if not ready: continue
             line = sys.stdin.readline().strip().lower()
             if not line:
+                if args.transport=='telemost':
+                    print('[RX] ENTER: stopping and saving WAV/CSV...',flush=True)
+                    stop.set()
+                    if capture and capture.poll() is None: capture.terminate()
+                    return
                 time.sleep(0.5)
                 continue
             if line in ('1','2','3'):
                 mode['value'] = {'1':'raw','2':'correct','3':'wrong'}[line]
                 print('[RX] SWITCHED TO:',mode['value'],flush=True)
-            elif line == 'q':stop.set()
+            elif line == 'q':
+                stop.set()
+                if capture and capture.poll() is None: capture.terminate()
 
     def on_frame(index, core, status, meta):
         index=int(index)
@@ -244,9 +265,9 @@ def live_rx(args):
         if args.transport == 'pulse':module=create_sink()
         player=subprocess.Popen(['paplay','--raw','--format=s16le','--rate=16000','--channels=1',
                                   '--device='+sink],stdin=subprocess.PIPE,bufsize=0)
-        if args.transport=='pulse':
+        if args.transport in ('pulse','telemost'):
             capture=subprocess.Popen(['parec','--raw','--format=s16le','--rate=20000',
-                                      '--channels=1','--latency-msec=40','--device='+LOOP_SINK+'.monitor'],stdout=subprocess.PIPE,bufsize=0)
+                                      '--channels=1','--latency-msec=40','--device='+transport_sink(args)+'.monitor'],stdout=subprocess.PIPE,bufsize=0)
         else:
             sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -258,7 +279,7 @@ def live_rx(args):
         print('[RX] transport=%s speaker=%s codec=%s listening=%s:%s' % (
             args.transport,sink,args.codec,args.bind,args.port),flush=True)
         print('[RX] CONTROLS: 1=RAW ENCRYPTED, 2=CORRECT, 3=WRONG(+%d), q=QUIT' % args.wrong_shift,flush=True)
-        if args.transport=='pulse':print('[RX] NOW START TX in SECOND TERMINAL.',flush=True)
+        if args.transport in ('pulse','telemost'):print('[RX] NOW START TX on the other PC.',flush=True)
         started=time.monotonic()
         # Deliberately re-chunk the audio stream into chunks not aligned to 400 samples.
         # The synchronizer sees raw continuous PCM and MUST find PN positions itself.
@@ -273,6 +294,7 @@ def live_rx(args):
             else:
                 data=read_exact(capture.stdout,800)
                 if len(data)!=800:break
+            if w_wire:w_wire.writeframes(data)
             pending=np.concatenate((pending,pcm(data)))
             while len(pending)>=173:
                 sync.push(pending[:173],time.monotonic())
@@ -284,7 +306,12 @@ def live_rx(args):
         print('[RX] interrupted',flush=True)
     finally:
         stop.set()
+        if sync is not None:
+            numbers['sync_stats']=dict(getattr(sync,'stats',{}))
+            numbers['sync_state']=str(getattr(sync,'state','unknown'))
+        numbers['transport']=args.transport
         for w in (w_cipher,w_correct,w_wrong):w.close()
+        if w_wire:w_wire.close()
         csvfile.close();events.close()
         if player:
             try:player.stdin.close()
@@ -300,6 +327,42 @@ def live_rx(args):
             except subprocess.CalledProcessError:pass
         (outdir/'rx_summary.json').write_text(json.dumps(numbers,indent=2)+'\n')
         print('[RX] saved 3 WAVs + frames.csv in',outdir,flush=True)
+
+
+def telemost_tx(args):
+    """Same verified ProofCipher and live_tx, only virtual Chrome routing differs."""
+    from experiment.telemostTest import VirtualAudio, AutoRouter
+    # Select physical MIC *before* virtual source creation, otherwise PA defaults can change.
+    args.mic_source=require(args.mic_source or default('sources'),'sources')
+    print('[TX] Physical microphone:',args.mic_source,flush=True)
+    with VirtualAudio('tx'):
+        print('Telemost TX: choose MICROPHONE NearS_TX_Microphone in Chrome.',flush=True)
+        input('PRESS ENTER to START live encrypted speech... ')
+        with AutoRouter('tx') as router:
+            router.ensure_tx()
+            args.telemost_stop=threading.Event()
+            def wait_stop():
+                try:input('[TX] Sending. PRESS ENTER to STOP and save... ')
+                except EOFError:return
+                args.telemost_stop.set()
+                proc=getattr(args,'telemost_capture',None)
+                if proc and proc.poll() is None:proc.terminate()
+            threading.Thread(target=wait_stop,daemon=True).start()
+            live_tx(args)
+    print('[TX] Finished; stop RX after 2 seconds.',flush=True)
+
+
+def telemost_rx(args):
+    from experiment.telemostTest import VirtualAudio, AutoRouter
+    # Select real headphones before PA virtual RX sink exists.
+    args.speaker_sink=require(args.speaker_sink or default('sinks'),'sinks')
+    print('[RX] Physical headphones:',args.speaker_sink,flush=True)
+    with VirtualAudio('rx'):
+        print('Telemost RX: choose SPEAKERS NearS_RX in Chrome.',flush=True)
+        input('PRESS ENTER to START receiving audio... ')
+        with AutoRouter('rx'):
+            print('[RX] Press 1+Enter RAW, 2+Enter CORRECT, 3+Enter WRONG; empty ENTER stops.',flush=True)
+            live_rx(args)
 
 
 def selftest(args):
@@ -328,9 +391,9 @@ def selftest(args):
 
 
 def main():
-    p=argparse.ArgumentParser(description='NearS LIVE 3-mode proof: actual sync.v2_timepack, local PulseAudio or real UDP, NO SonoBus')
+    p=argparse.ArgumentParser(description='NearS LIVE 3-mode proof: actual sync.v2_timepack, local PulseAudio, UDP or Telemost')
     p.add_argument('--role',choices=['tx','rx','selftest'],required=True)
-    p.add_argument('--transport',choices=['pulse','udp'],default='pulse')
+    p.add_argument('--transport',choices=['pulse','udp','telemost'],default='pulse')
     p.add_argument('--key-file',default='.secrets/stft_test.key')
     p.add_argument('--session',default='syncproof-1')
     p.add_argument('--out',default='/tmp/syncproof')
@@ -347,8 +410,10 @@ def main():
     p.add_argument('--guard-amp',type=float,default=.12)
     args=p.parse_args()
     if args.tx_gain<=0 or args.guard_amp<=0 or args.duration<0:p.error('invalid gain or duration')
-    if args.role=='tx':live_tx(args)
-    elif args.role=='rx':live_rx(args)
+    if args.role=='tx':
+        telemost_tx(args) if args.transport=='telemost' else live_tx(args)
+    elif args.role=='rx':
+        telemost_rx(args) if args.transport=='telemost' else live_rx(args)
     else:selftest(args)
 
 if __name__=='__main__':main()
