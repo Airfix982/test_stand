@@ -146,11 +146,39 @@ def _read_exact(stream, nbytes):
     return b''.join(parts)
 
 
-def _live_batches(batch_size=4):
-    default_source = next((line.split(':',1)[1].strip() for line in pactl('info').splitlines() if line.startswith('Default Source:')),None)
-    if not default_source or default_source=='tx_mic':
-        raise RuntimeError('Physical Default Source not found; select physical mic as PulseAudio default source')
-    cmd=['parec',f'--device={default_source}','--raw','--format=s16le',f'--rate={RATE}','--channels=1','--latency-msec=30']
+def _pulse_default(kind):
+    label = 'Default Source:' if kind == 'sources' else 'Default Sink:'
+    return next((line.split(':',1)[1].strip() for line in pactl('info').splitlines() if line.startswith(label)), None)
+
+
+def _physical_endpoint(kind, selected=None):
+    # Resolve BEFORE loading virtual sinks: module-switch-on-connect may change defaults.
+    names = [row.split()[1] for row in pactl('list','short',kind).splitlines() if len(row.split()) >= 2]
+    excluded = {'tx_mic','rx_sink','tx_enc_sink'}
+    if kind == 'sources':
+        excluded.update(n for n in names if n.endswith('.monitor'))
+    usable = [n for n in names if n not in excluded]
+    if selected:
+        if selected not in usable:
+            raise RuntimeError('%s %r is unavailable or virtual; usable: %s' % (kind, selected, ', '.join(usable)))
+        return selected
+    default = _pulse_default(kind)
+    if default in usable:
+        return default
+    hardware_prefixes = ('alsa_input.','bluez_input.') if kind == 'sources' else ('alsa_output.','bluez_output.')
+    candidates = [n for n in usable if n.startswith(hardware_prefixes)]
+    if candidates:
+        return candidates[0]
+    if len(usable) == 1:
+        return usable[0]
+    raise RuntimeError('Cannot select physical %s; pass --%s. Candidates: %s' % (
+        kind, 'mic-source' if kind == 'sources' else 'speaker-sink', ', '.join(usable)))
+
+
+def _live_batches(batch_size=4, mic_source=None):
+    if not mic_source:
+        raise RuntimeError('Physical microphone must be selected before creating virtual devices')
+    cmd=['parec',f'--device={mic_source}','--raw','--format=s16le',f'--rate={RATE}','--channels=1','--latency-msec=30']
     p=subprocess.Popen(cmd,stdout=subprocess.PIPE,bufsize=0)
     try:
         while True:
@@ -159,34 +187,53 @@ def _live_batches(batch_size=4):
                 break
             yield np.frombuffer(b,dtype='<i2').astype(np.float32).reshape(batch_size,FRAME)/32768.0
     finally:
-        p.terminate()
+        if p.poll() is None:
+            p.terminate()
         try:p.wait(timeout=2)
         except subprocess.TimeoutExpired:p.kill();p.wait()
 
 
 def _generate_frames(cipher, input_batches, guardbank, outfile, duration=0.0, player=None, gain=0.75, guard_amp=0.12):
     start=time.perf_counter()
-    stats={'tx_frames':0,'cipher_cpu_sec':0.0,'wire_rate':OUT_RATE,'payload_samples':FRAME,'guard_samples':GUARD_SAMPLES}
-    max_frames = int(round(duration*50)) if duration else None
-    for batch in input_batches:
-        batch=check_batch(batch,np.arange(len(batch)))
-        first=stats['tx_frames']
-        if max_frames is not None and first>=max_frames:
-            break
-        indices=np.arange(first,first+len(batch),dtype=np.int64)
-        t=time.process_time()
-        encoded=cipher.encode_batch(batch,indices)
-        stats['cipher_cpu_sec']+=time.process_time()-t
-        encoded=check_batch(encoded,indices)
-        count=len(encoded) if max_frames is None else min(len(encoded),max_frames-first)
-        pcm=b''.join(_pcm(_frame_to_wire(encoded[j],int(indices[j]),guardbank,gain,guard_amp)) for j in range(count))
-        outfile.writeframes(pcm)
-        if player is not None:
-            player.stdin.write(pcm)
-        stats['tx_frames']+=count
-        if first%250==0:
-            print('TX crypto frames:',stats['tx_frames'],'cipher_cpu_sec:',round(stats['cipher_cpu_sec'],2),flush=True)
+    stats={'tx_frames':0,'cipher_cpu_sec':0.0,'wire_rate':OUT_RATE,
+           'payload_samples':FRAME,'guard_samples':GUARD_SAMPLES,
+           'input_rms_dbfs_latest':None,'stopped_by_user':False}
+    max_frames = int(round(duration*50)) if duration>0 else None
+    report_at = 250
+    try:
+        for batch in input_batches:
+            batch=check_batch(batch,np.arange(len(batch)))
+            first=stats['tx_frames']
+            if max_frames is not None and first>=max_frames:
+                break
+            indices=np.arange(first,first+len(batch),dtype=np.int64)
+            t=time.process_time()
+            encoded=cipher.encode_batch(batch,indices)
+            stats['cipher_cpu_sec']+=time.process_time()-t
+            encoded=check_batch(encoded,indices)
+            count=len(encoded) if max_frames is None else min(len(encoded),max_frames-first)
+            pcm=b''.join(_pcm(_frame_to_wire(encoded[j],int(indices[j]),guardbank,gain,guard_amp)) for j in range(count))
+            if outfile is not None:
+                outfile.writeframes(pcm)
+            if player is not None:
+                player.stdin.write(pcm)
+            stats['tx_frames']+=count
+            rms=float(np.sqrt(np.mean(np.asarray(batch[:count],dtype=np.float64)**2)))
+            stats['input_rms_dbfs_latest']=round(20*np.log10(max(rms,1e-9)),2)
+            if stats['tx_frames']>=report_at:
+                audio_sec=stats['tx_frames']/50.0
+                print('TX LIVE audio=%.1fs cipher_cpu_ratio=%.3f mic_rms=%.1f dBFS' % (
+                    audio_sec,stats['cipher_cpu_sec']/max(audio_sec,1e-6),stats['input_rms_dbfs_latest']),flush=True)
+                report_at+=250
+    except KeyboardInterrupt:
+        stats['stopped_by_user']=True
+        print('TX stopping by Ctrl+C; saving statistics...',flush=True)
+    finally:
+        close=getattr(input_batches,'close',None)
+        if callable(close):
+            close()
     stats['elapsed_wall_sec']=time.perf_counter()-start
+    stats['cipher_cpu_ratio']=stats['cipher_cpu_sec']/max(stats['tx_frames']/50.0,1e-9)
     return stats
 
 
@@ -206,6 +253,9 @@ def _handle_tx(args,out):
             if not args.input:
                 raise ValueError('--generate-only needs --input WAV')
             return
+        mic_source = _physical_endpoint('sources', args.mic_source) if not args.input else None
+        if mic_source:
+            print('[TX MIC] Physical input: %s' % mic_source,flush=True)
         with VirtualAudio('tx'):
             print("Select NearS_TX_Microphone as Telemost microphone; wait for RX, then ENTER.",flush=True)
             input('PRESS ENTER to start encrypted TX... ')
@@ -214,16 +264,20 @@ def _handle_tx(args,out):
                 if args.input:
                     subprocess.run(['paplay',f'--device={TX_SINK}',str(wavfile)],check=True)
                 else:
-                    max_seconds=args.duration or 30.0
-                    print('Capturing physical microphone; encoding live in batches of 4 frames.',flush=True)
+                    print('LIVE microphone capture; duration=%s; Ctrl+C to stop.' % (
+                        ('%.1f s' % args.duration) if args.duration else 'unlimited'),flush=True)
                     cmd=['paplay','--raw',f'--device={TX_SINK}',f'--rate={OUT_RATE}','--format=s16le','--channels=1']
-                    player=subprocess.Popen(cmd,stdin=subprocess.PIPE)
+                    player=subprocess.Popen(cmd,stdin=subprocess.PIPE,bufsize=0)
                     try:
-                        with _wav(wavfile,OUT_RATE) as wf:
-                            stats=_generate_frames(plugin,_live_batches(plugin.encode_batch_size),guardbank,wf,max_seconds,player,args.tx_gain,args.guard_amp)
+                        with contextlib.ExitStack() as recorder:
+                            wf=recorder.enter_context(contextlib.closing(_wav(wavfile,OUT_RATE))) if args.record_tx else None
+                            stats=_generate_frames(plugin,_live_batches(plugin.encode_batch_size,mic_source),guardbank,wf,args.duration,player,args.tx_gain,args.guard_amp)
                     finally:
-                        if player.stdin:player.stdin.close()
-                        player.wait(timeout=5)
+                        if player.stdin:
+                            try:player.stdin.close()
+                            except BrokenPipeError:pass
+                        try:player.wait(timeout=5)
+                        except subprocess.TimeoutExpired:player.terminate();player.wait()
             print('TX ended. Stop RX after a couple of seconds.',flush=True)
     finally:
         plugin.close()
@@ -264,7 +318,9 @@ def _handle_rx(args,out):
     summaries={'decrypted_frames':0,'skipped_lost_frames':0,'decrypt_cpu_sec':0.0,'input_audio_sec':0.0,'push_cpu_sec':0.0,'push_wall_sec':0.0,'max_push_ms':0.0}
     if hasattr(cipher, 'delay_frames'):
         summaries.update(spectral_transform=getattr(cipher,'transform',''), spectral_operation=getattr(cipher,'operation',''), spectral_hop_samples=cipher.hop_samples, startup_delay_transport_frames_each_direction=cipher.delay_frames)
-    default_sink=next((line.split(':',1)[1].strip() for line in pactl('info').splitlines() if line.startswith('Default Sink:')),None) if args.listen else None
+    physical_sink=args.physical_sink if args.listen and not args.wav else None
+    if args.listen and not args.wav and not physical_sink:
+        raise RuntimeError('Physical speaker must be selected before loading virtual devices')
     speaker=None
     try:
         with contextlib.ExitStack() as stack:
@@ -272,8 +328,8 @@ def _handle_rx(args,out):
             cipher_w=stack.enter_context(contextlib.closing(_wav(out/'rx_cipher_payload_16k.wav',RATE)))
             raw_w=stack.enter_context(contextlib.closing(_wav(out/'rx_raw_20k.wav',OUT_RATE)))
             if args.listen and not args.wav:
-                if not default_sink: raise RuntimeError('Cannot find physical speakers for --listen')
-                cmd=['paplay','--raw',f'--device={default_sink}',f'--rate={RATE}','--format=s16le','--channels=1']
+                if not physical_sink: raise RuntimeError('Cannot find physical speakers for --listen')
+                cmd=['paplay','--raw',f'--device={physical_sink}',f'--rate={RATE}','--format=s16le','--channels=1']
                 speaker=subprocess.Popen(cmd,stdin=subprocess.PIPE)
             def on_frame(index,wireframe,status,meta):
                 core=np.asarray(wireframe,dtype=np.float32)[:FRAME] if status=='ok' else None
@@ -370,13 +426,18 @@ def main():
     p.add_argument('--input',help='TX: mono WAV speech input, pre-encrypted before Telemost')
     p.add_argument('--generate-only',action='store_true',help='TX: prepare WAV only, without creating devices')
     p.add_argument('--wav',help='RX: offline captured TimePack 20k WAV instead of Telemost')
-    p.add_argument('--duration',type=float,default=0.0,help='TX live duration; TX input clip; RX live maximum')
+    p.add_argument('--duration',type=float,default=0.0,help='Live duration in seconds; 0 = unlimited until Ctrl+C')
+    p.add_argument('--mic-source',help='TX: exact physical PulseAudio source name; default auto-detected before virtual devices')
+    p.add_argument('--speaker-sink',help='RX: exact physical PulseAudio sink name for --listen')
+    p.add_argument('--record-tx',action='store_true',help='Save live TX encrypted PCM WAV for debugging (default: do not record)')
     p.add_argument('--listen',action='store_true',help='RX: play DECRYPTED speech on physical speakers')
     p.add_argument('--tx-gain',type=float,default=.75)
     p.add_argument('--guard-amp',type=float,default=.12)
     p.add_argument('--output-gain',type=float,default=1.0)
     p.add_argument('--io-samples',type=int,default=200)
     args=p.parse_args()
+    if args.duration<0:
+        p.error('--duration cannot be negative')
     if args.io_samples<=0 or args.tx_gain<=0 or args.guard_amp<=0:
         p.error('positive gains and io-samples required')
     out=Path(args.out).expanduser().resolve()
@@ -385,6 +446,9 @@ def main():
     elif args.wav:
         _handle_rx(args,out)
     else:
+        args.physical_sink = _physical_endpoint('sinks', args.speaker_sink) if args.listen else None
+        if args.physical_sink:
+            print('[RX SPEAKERS] Physical output: %s' % args.physical_sink,flush=True)
         with VirtualAudio('rx'):
             print('TELEMOST RX: select SPEAKERS NearS_RX, then ENTER.',flush=True)
             input('PRESS ENTER to record/decrypt ... ')
