@@ -3,7 +3,8 @@
 **/analysis_10m/
 **/analyze_test/
 **/records/
-**/algoss/
+**/algoss/archives
+**/algoss/alg7_kra
 
 **/analysis_*/
 *.wav
