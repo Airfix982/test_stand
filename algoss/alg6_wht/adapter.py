@@ -1,23 +1,20 @@
-"""Standalone research cipher adapter: 320 PCM16 samples per frame.
-Input/output are float32 [-1,1]; index is the SuperSpinner absolute frame number.
-"""
+"""Dedicated 320-sample cipher adapter (research/experimental)."""
 import hashlib
 from pathlib import Path
 import numpy as np
-from experiment.ALG6_syncCipherSourceLoader import load_source
-from experiment.ALG6_syncCipherVdoRuntime import pcm, floats, N
+from experiment.ALG6.ALG6_syncCipherSourceLoader import load_source
+from experiment.ALG6.ALG6_syncCipherServiceRuntime import pcm, floats, N
 META=dict(sample_rate=16000,sample_width_bytes=2,bits_per_sample=16,
           min_value=-32768,max_value=32767,dtype_name='int16')
-
 def seed01(secret,index):
-    d=hashlib.sha256(f'{secret}:{index}'.encode()).digest()
-    return (int.from_bytes(d[:8],'big')+.5)/2**64
+    h=hashlib.sha256(f'{secret}:{index}'.encode()).digest()
+    return (int.from_bytes(h[:8],'big')+.5)/2**64
 
 from functools import lru_cache
 class Cipher:
     def __init__(self,secret):
-        self.secret=secret;self.m=load_source(Path(__file__).with_name('wht_v3.py'))
-        self.m['META_SECRET']=secret
+        self.secret=str(secret);self.m=load_source(Path(__file__).with_name('wht_v3.py'))
+        self.m['META_SECRET']=self.secret
     @lru_cache(maxsize=256)
     def positions(self,index):
         perm=self.m['build_permutation'](512,int(index))
@@ -25,7 +22,6 @@ class Cipher:
         assert len(pos)==128
         return pos
     def encode(self,voice,index):
-        # 320->512 transform length; 128 kept int32 words -> 256 PCM16 words.
         x=np.pad(pcm(voice).astype(np.int64),(0,192))
         encrypted=self.m['encrypt_chunk'](x,META,int(index))
         words=np.asarray(encrypted,dtype='<i4')[self.positions(index)]
