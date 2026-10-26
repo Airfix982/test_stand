@@ -29,5 +29,5 @@ def load_source(path):
                         if kw.arg=='cache':kw.value=ast.Constant(False)
     ast.fix_missing_locations(tree)
     ns={'__file__':str(path),'__name__':'_nears_loaded_'+path.stem}
-    exec(compile(tree,str(path),'exec'),ns)
+    exec(compile(tree, str(path), 'exec', flags=__import__('__future__').annotations.compiler_flag), ns)
     return ns
