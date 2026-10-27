@@ -9,3 +9,4 @@
 
 **/analysis_*/
 *.wav
+!**/sounds/*.wav
