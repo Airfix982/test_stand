@@ -598,31 +598,69 @@ def encrypt_chunk(chunk_signed: np.ndarray, meta: Dict, chunk_index: int) -> np.
     return cipher_i32
 
 def decrypt_chunk(cipher_signed: np.ndarray, meta: Dict, chunk_index: int) -> np.ndarray:
+    """Decode exact int32 words; reject detected invalid data before casting.
+
+    These are numerical sanity checks, not an integrity/authentication check.
+    Some altered ciphertexts still pass them and decode to incorrect audio.
+    """
+    cipher_signed = np.asarray(cipher_signed)
+    if cipher_signed.ndim != 1:
+        raise ValueError("WHT ciphertext must be a one-dimensional int32 container")
     n = len(cipher_signed)
     if not is_power_of_two(n):
         raise ValueError("chunk size must be power of two for FWHT")
+    if not np.issubdtype(cipher_signed.dtype, np.integer):
+        raise ValueError("WHT ciphertext must contain integer words, not audio floats")
+    if np.any(cipher_signed < -(1 << 31)) or np.any(cipher_signed > (1 << 31) - 1):
+        raise ValueError("WHT ciphertext word outside signed int32 range")
 
     cipher_u32 = int32_container_to_uint32_words(cipher_signed)
-
     key1, key2 = derive_key1_key2(META_SECRET, chunk_index)
-    key_norm, _ = build_key_norm_from_key1_key2(
-        key1=key1,
-        key2=key2,
-        length=len(cipher_u32),
-    )
+    key_norm, _ = build_key_norm_from_key1_key2(key1, key2, len(cipher_u32))
+    if not np.isfinite(key_norm).all():
+        raise ValueError(f"WHT chunk={chunk_index}: nonfinite generated keystream")
 
     k_u32 = float32_array_to_uint32_words(key_norm)
     c1_u32 = np.bitwise_xor(cipher_u32, k_u32)
 
-    mwz_perm_f32 = uint32_words_to_float32_array(c1_u32)
+    # Inspect integer exponent bits BEFORE any floating-point operation:
+    # converting a signalling NaN from float32 to float64 itself raises invalid.
+    invalid = (c1_u32 & np.uint32(0x7F800000)) == np.uint32(0x7F800000)
+    count = int(np.count_nonzero(invalid))
+    if count:
+        raise ValueError(
+            f"WHT chunk={chunk_index}: NaN/Inf coefficients={count}/{n}; "
+            "check ciphertext words, shared secret, frame index and key generation"
+        )
 
-    perm = build_permutation(len(mwz_perm_f32), chunk_index)
+    mwz_perm_f32 = uint32_words_to_float32_array(c1_u32)
+    perm = build_permutation(n, chunk_index)
     inv = invert_permutation(perm)
     mwz_rec = mwz_perm_f32[inv].astype(np.float64)
 
-    restored = ifwht_inplace_float(mwz_rec)
+    # A normalized WHT coefficient of valid centered PCM cannot exceed
+    # the maximum absolute input PCM value. Do not apply this optional
+    # check when the caller did not supply an original PCM sample width.
+    sample_width = meta.get("sample_width_bytes")
+    if sample_width in (1, 2, 4):
+        coefficient_limit = float(1 << (8 * sample_width - 1))
+        if np.any(np.abs(mwz_rec) > coefficient_limit):
+            raise ValueError(
+                f"WHT chunk={chunk_index}: coefficient exceeds PCM bound "
+                f"{coefficient_limit:g}; check ciphertext/key/frame index"
+            )
 
-    return np.rint(restored).astype(np.int64)
+    restored = ifwht_inplace_float(mwz_rec)
+    rounded = np.rint(restored)
+    if (not np.isfinite(rounded).all()
+            or np.any(rounded < -(2.0 ** 63))
+            or np.any(rounded >= 2.0 ** 63)):
+        raise ValueError(
+            f"WHT chunk={chunk_index}: decoded values outside finite int64 range; "
+            "check ciphertext/key/frame index"
+        )
+    return rounded.astype(np.int64)
+
 
 
 # ШИФРОВАНИЕ ДЕШИФР ВСЕГО СИГНАЛА
