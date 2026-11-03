@@ -5,6 +5,7 @@ RX <- system virtual speaker NearS_RX (sink rx_sink)
 No browser/app auto start or automatic stream routing.
 """
 import argparse, csv, json, os, select, shutil, subprocess as sp, sys, threading, time, wave
+from functools import partial
 from pathlib import Path
 for _k in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'):
     os.environ[_k] = '1'
@@ -104,7 +105,7 @@ def tx(a):
     mic=physical('sources',a.mic) if not a.source_file else None
     root=Path(a.out).resolve();root.mkdir(parents=True,exist_ok=True)
     bank=np.asarray(makeGuardBank(WFS,GUARD,64),dtype=np.float32)
-    stop=threading.Event();capture=player=None;count=0;cpu=0.;source_done=False
+    stop=threading.Event();capture=player=None;count=0;cpu=0.;source_done=False;input_samples=0;padded_samples=0
     try:
         with VirtualAudio('tx'):
             print('\n[TX READY] Microphone: NearS_TX_Microphone (Pulse source: tx_mic)')
@@ -121,7 +122,14 @@ def tx(a):
             with wav(root/'tx_original_16k.wav',FS) as original, wav(root/'tx_wire_20k.wav',WFS) as sent:
                 while not stop.is_set():
                     raw=readn(capture.stdout,N*2*batch)
-                    if len(raw)<N*2*batch or stop.is_set():break
+                    if not raw or stop.is_set():break
+                    if len(raw)%2:raise ValueError('Odd number of bytes in PCM16 source')
+                    input_samples+=len(raw)//2
+                    if len(raw)<N*2*batch:
+                        if not a.source_file:break
+                        missing=N*2*batch-len(raw)
+                        padded_samples+=missing//2
+                        raw+=b'\0'*missing  # Preserve 4-frame speech_encoder batch at EOF.
                     samples=floats(np.frombuffer(raw,dtype='<i2')).reshape(batch,N)
                     inds=np.arange(count,count+batch,dtype=np.int64)
                     t=time.perf_counter()
@@ -153,7 +161,8 @@ def tx(a):
     finally:
         stop.set();stop_proc(capture);stop_proc(player,True);c.close()
         summary=dict(scenario=a.scenario,frames=count,source_completed=source_done,encode_cpu_sec=cpu,
-                     source_file=a.source_file,wire_rate=WFS)
+                     source_file=a.source_file,wire_rate=WFS,input_samples_16k=input_samples,
+                     padded_samples_16k=padded_samples,frames_per_batch=batch)
         (root/'summary.json').write_text(json.dumps(summary,indent=2))
         print('[TX] Output:',root,flush=True)
 
@@ -162,7 +171,9 @@ def rx(a):
     c=a.cipher(a.secret);root=Path(a.out).resolve();root.mkdir(parents=True,exist_ok=True)
     speaker=physical('sinks',a.speaker) if a.play else None
     stop=threading.Event();mode=[a.listen_mode];capture=player=None;sync=None
-    stats=dict(scenario=a.scenario,ok=0,lost=0,decoded=0,decode_errors=0,decode_cpu_sec=0.,rx_samples=0,selected_mode=a.listen_mode)
+    gain_state=[1.0]; pn_bank=(np.asarray(makeGuardBank(WFS,GUARD,64),np.float32) if a.pn_gain_correction else None)
+    stats=dict(scenario=a.scenario,ok=0,lost=0,decoded=0,decode_errors=0,decode_cpu_sec=0.,rx_samples=0,selected_mode=a.listen_mode,
+               core_adjusted=0,core_adjust_max_abs=0,estimated_guards=0,pn_gain_correction=bool(a.pn_gain_correction))
     try:
         # --received-file: decode a downloaded file directly. No virtual sink is needed.
         from contextlib import nullcontext
@@ -183,16 +194,38 @@ def rx(a):
             with wav(root/'rx_incoming_20k.wav',WFS) as incoming, wav(root/'rx_cipher_16k.wav',FS) as cipher_wav, \
                  wav(root/'rx_listened_16k.wav',FS) as listened, (root/'frames.csv').open('w',newline='') as csv_f, \
                  (root/'events.jsonl').open('w') as events:
-                writer=csv.writer(csv_f);writer.writerow(['frame_index','status','corr','mode','decode_ms'])
+                writer=csv.writer(csv_f);writer.writerow(['frame_index','status','corr','mode','decode_ms',
+                     'guard_source','core_input_samples','core_correction_samples','recovered_gap','pn_gain'])
                 def frame(index,packet,status,meta):
                     index=int(index)+a.index_offset
                     valid=status=='ok';stats['ok' if valid else 'lost']+=1
-                    wire=np.clip(np.asarray(packet,dtype=np.float32)[:N]/a.payload_gain,-1,1) if valid else np.zeros(N,dtype=np.float32)
+                    correction=meta.get('core_correction_samples','')
+                    if correction not in ('',None):
+                        correction=int(correction)
+                        stats['core_adjusted']+=int(correction!=0)
+                        stats['core_adjust_max_abs']=max(stats['core_adjust_max_abs'],abs(correction))
+                    stats['estimated_guards']+=int(meta.get('guard_source')=='estimated')
+                    # Reference-free gain estimate from PUBLIC PN guard. Not the
+                    # offline reference/cross-correlation with clean TX ciphertext.
+                    # Synchronizer has already found the guard's physical position.
+                    if valid and pn_bank is not None and meta.get('guard_pos') is not None:
+                        pos=int(meta['guard_pos'])
+                        observed=sync.buf.slice(pos,pos+GUARD)
+                        if observed is not None:
+                            reference=pn_bank[index%64]*a.guard_amp
+                            estimate=float(np.dot(observed,reference)/max(1e-10,np.dot(reference,reference)))
+                            quality=meta.get('corr',0)
+                            quality=float(quality) if quality not in ('',None) else 0.0
+                            if quality>=0.45 and .25<=estimate<=4.0:
+                                gain_state[0]=.85*gain_state[0]+.15*estimate
+                    gain = gain_state[0] if a.pn_gain_correction else 1.0
+                    wire=np.clip(np.asarray(packet,dtype=np.float32)[:N]/(a.payload_gain*gain),-1,1) if valid else np.zeros(N,dtype=np.float32)
                     cipher_wav.writeframes(pcm(wire).tobytes())
                     current=mode[0];t=time.perf_counter()
                     try:
                         if current=='raw':decoded=wire
-                        elif not valid:decoded=np.zeros(N,dtype=np.float32)
+                        elif not valid:
+                            decoded=c.decode_lost(index) if hasattr(c,'decode_lost') else np.zeros(N,dtype=np.float32)
                         else:
                             target=index+(a.wrong_shift if current=='wrong' else 0)
                             decoded=(c.decode_frame(wire,target) if hasattr(c,'decode_frame') else c.decode(wire,target))
@@ -206,7 +239,9 @@ def rx(a):
                     if player:
                         try:player.stdin.write(b)
                         except BrokenPipeError:stop.set()
-                    writer.writerow([index,status,meta.get('corr',''),current,round(dt*1000,3)])
+                    writer.writerow([index,status,meta.get('corr',''),current,round(dt*1000,3),
+                        meta.get('guard_source',''),meta.get('core_input_samples',''),
+                        meta.get('core_correction_samples',''),meta.get('recovered_gap',''),round(gain,6)])
                     if (stats['ok']+stats['lost'])%250==0:print('[RX] ok=%d lost=%d decoded=%d mode=%s'%(stats['ok'],stats['lost'],stats['decoded'],current),flush=True)
                 def on_event(ev):
                     if hasattr(c,'on_sync_event'):c.on_sync_event(ev)
@@ -217,7 +252,10 @@ def rx(a):
                 while not stop.is_set():
                     b=readn(capture.stdout,2*173)
                     if len(b)<2*173:
-                        if b and len(b)%2==0: sync.push(floats(np.frombuffer(b,dtype='<i2')),time.monotonic());stats['rx_samples']+=len(b)//2
+                        if b and len(b)%2==0:
+                            incoming.writeframes(b)
+                            sync.push(floats(np.frombuffer(b,dtype='<i2')),time.monotonic())
+                            stats['rx_samples']+=len(b)//2
                         break
                     incoming.writeframes(b);x=floats(np.frombuffer(b,dtype='<i2'))
                     sync.push(x,time.monotonic());stats['rx_samples']+=len(x)
@@ -225,6 +263,7 @@ def rx(a):
                 # Explicit flush, including after EOF for media files.
                 if sync and not stop.is_set():sync.finish()
                 stats['selected_mode']=mode[0]
+                stats['pn_gain_final']=round(gain_state[0],6)
     except (KeyboardInterrupt,BrokenPipeError):pass
     finally:
         stop.set();stop_proc(capture);stop_proc(player,True);c.close()
@@ -258,17 +297,24 @@ def main(cipher,name,default_scenario='call'):
     p.add_argument('--scenario',choices=['call','message'],default=default_scenario)
     p.add_argument('--source-file',help='TX: any ffmpeg-decodable audio file, mono/resampled to 16k internally')
     p.add_argument('--received-file',help='RX message: decoded audio/media downloaded from service, internally 20k mono')
-    p.add_argument('--secret',default=os.getenv('NEARS_ALGO_SECRET','nears-test'))
+    p.add_argument('--secret','--alg7-seed',dest='secret',default=os.getenv('NEARS_ALG7_SEED','37'))
+    p.add_argument('--algo-dir',default=None,help='Path to unmodified ALG7 models and native binaries')
+    p.add_argument('--synth-gain',type=float,default=1.0,help='RX LPC synthesis output gain; does not affect encryption')
     p.add_argument('--listen-mode',choices=['raw','correct','wrong'],default='correct')
     p.add_argument('--wrong-shift',type=int,default=64)
     p.add_argument('--index-offset',type=int,default=0,help='RX: absolute frame offset; use for delayed streams if known')
     p.add_argument('--payload-gain',type=float,default=1.)
     p.add_argument('--guard-amp',type=float,default=.12)
+    p.add_argument('--pn-gain-correction',action='store_true',help='RX only: compensate gain using known PN guard, NO TX clean reference')
     p.add_argument('--mic');p.add_argument('--speaker')
     p.add_argument('--no-play',action='store_false',dest='play',help='RX do not play into physical speakers')
     p.add_argument('--duration',type=float,default=0.)
     p.add_argument('--out',default='/tmp/nears_service_'+name)
-    a=p.parse_args();a.cipher=cipher;a.name=name
+    a=p.parse_args();a.name=name
+    try: int(a.secret)
+    except ValueError: p.error('ALG7 requires integer seed (e.g. --secret 37)')
+    if a.synth_gain<=0: p.error('--synth-gain must be positive')
+    a.cipher=partial(cipher,algo_dir=a.algo_dir,synth_gain=a.synth_gain)
     if a.index_offset%64: p.error('--index-offset must be a multiple of 64; PN cycle=64')
     if not (0<a.payload_gain<=1):p.error('--payload-gain must be in (0,1]')
     if a.role=='tx':tx(a)

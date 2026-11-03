@@ -49,8 +49,8 @@ def _load_module_tree(directory):
         raise FileNotFoundError('Missing native estimator: %s' % pitch_lib)
     if not os.access(directory / 'speech_encoder', os.X_OK):
         raise PermissionError('speech_encoder must be executable: chmod +x %s' % (directory / 'speech_encoder'))
-    # The supplied pseudo_speech.py uses `from single_pitch import single_pitch`
-    # (absolute import). Expose its original directory to the Python import system.
+    # Package import uses `from .single_pitch import single_pitch`; keep the original
+    # directory available for any auxiliary legacy absolute imports.
     existing = sys.modules.get('single_pitch')
     if existing is not None:
         previous = getattr(existing, '__file__', None)
@@ -174,6 +174,16 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
         self.crypt = m['encryption'].Encryption_class(self.directory/'spherical_code.npz')
         self.ps = m['pseudo_speech'].Pseudospeech_Synthetizer_class(self.directory/'pseudospeech_model.npz', self.directory/'spherical_code.npz')
         self.PseudoState = m['pseudo_speech'].parameters_pseudospeech
+        # The offline run_alg7_opus.py required flattening the model radii.
+        # Preserve the model file and original crypto, normalize only in memory.
+        for attr, count in (('c_0', int(self.ps.G_dim_half)),
+                            ('u_0', int(self.ps.G_dim))):
+            vector = np.asarray(getattr(self.ps, attr), dtype=np.float64).reshape(-1)
+            if len(vector) != count or not np.all(np.isfinite(vector)):
+                raise ValueError('Invalid ALG7 model %s: expected %d finite entries' % (attr, count))
+            if attr == 'c_0' and np.any(vector <= 0):
+                raise ValueError('Invalid ALG7 model c_0: radii must be positive')
+            setattr(self.ps, attr, vector.copy())
         self.pitch_estimator_class = m['single_pitch'].single_pitch
         self.synth = m['DirectLPCSynthesizer'].DirectLPCSynthesizer(fs=8000,frame_size=160,periodic_mix=.5,seed=synth_seed)
         self.enc_state = self.PseudoState(self.ps.band_num,self.ps.harm_num_max)
@@ -184,8 +194,8 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
         self.bits_per_frame = int(self.crypt.encryption_bits[2])
         self._key_cursor = OriginalNumpyRngCursor(self.original_seed, self.bits_per_frame)
         self.output_gain = float(output_gain)
-        if int(self.ps.Fs)!=16000 or int(self.ps.flng+self.ps.glng)!=320 or int(self.analyzer.speech_frame_size)!=160:
-            raise ValueError('This adapter expects speech analyzer 8k/160, pseudo-speech 16k/320; actual: analyzer=%s, ps.Fs=%s, ps.frame=%s' % (self.analyzer.speech_frame_size, self.ps.Fs, self.ps.flng+self.ps.glng))
+        if int(self.ps.Fs)!=16000 or int(self.ps.flng)!=240 or int(self.ps.glng)!=80 or int(self.ps.flng+self.ps.glng)!=320 or int(self.analyzer.speech_frame_size)!=160:
+            raise ValueError('ALG7 needs analyzer 8k/160 and pseudo speech Fs=16000, flng=240, glng=80; got speech_frame=%s, Fs=%s, flng=%s, glng=%s' % (self.analyzer.speech_frame_size, self.ps.Fs, self.ps.flng, self.ps.glng))
         self.lost_count = 0
 
     def get_key_for_frame(self, frame_index):
@@ -210,6 +220,9 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
 
     def encode_batch(self, frames, indices):
         frames = check_batch(frames,indices)
+        indices = np.asarray(indices, dtype=np.int64)
+        if len(indices) and not np.array_equal(indices, np.arange(indices[0], indices[0]+len(indices))):
+            raise ValueError('ALG7 TX batch frame indices must be consecutive')
         if len(frames) != self.encode_batch_size:
             raise ValueError('Legacy LPCNet TX requires batches of exactly four 20ms frames')
         x16 = np.clip(np.rint(frames.reshape(-1)*32767.0),-32768,32767).astype(np.int16)
@@ -231,9 +244,11 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
     def decode_frame(self,pcm,ctx):
         if ctx.status != 'ok' or pcm is None:
             self.lost_count += 1
+            # Preserve ORIGINAL RNG sequence, consuming the skipped frame key.
+            self.get_key_for_frame(ctx.index)
             return np.zeros(320,dtype=np.float32)
         pcm = check_frame(pcm)
-        x = np.asarray(np.clip(np.rint(pcm*32767.0),-32768,32767),dtype=np.int16)
+        x = np.asarray(np.clip(np.rint(pcm*32768.0),-32768,32767),dtype=np.int16)
         chunk = x[self.ps.glng:].astype(np.float64)
         X = np.fft.fft(chunk)
         self.dec_state.envelope_vector = 2*np.real((X[:len(X)//2]@self.ps.filter_bank.T)*self.rot)
@@ -257,3 +272,8 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
             raise RuntimeError('LPC synthesized %d samples, expected 320' % len(y16))
         # DirectLPC outputs in 16-bit PCM amplitude units; no per-frame AGC.
         return np.clip(y16*self.output_gain/32768.0,-1.0,1.0).astype(np.float32)
+
+    def on_sync_event(self, event):
+        # The transport owns PN detection; ALG7 never re-aligns with a clean TX reference.
+        # The event is informational and must NOT reseed the original RNG.
+        self.last_sync_event = dict(event)
