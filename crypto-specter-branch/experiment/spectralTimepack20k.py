@@ -431,7 +431,7 @@ def main():
     p.add_argument('--speaker-sink',help='RX: exact physical PulseAudio sink name for --listen')
     p.add_argument('--record-tx',action='store_true',help='Save live TX encrypted PCM WAV for debugging (default: do not record)')
     p.add_argument('--listen',action='store_true',help='RX: play DECRYPTED speech on physical speakers')
-    p.add_argument('--tx-gain',type=float,default=.75)
+    p.add_argument('--tx-gain',type=float,default=1.95)
     p.add_argument('--guard-amp',type=float,default=.12)
     p.add_argument('--output-gain',type=float,default=1.0)
     p.add_argument('--io-samples',type=int,default=200)

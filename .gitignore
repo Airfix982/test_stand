@@ -4,7 +4,8 @@
 **/analyze_test/
 **/records/
 **/algoss/archives
-**/algoss/alg7_kra
+**/algoss/alg7_kra/*
+!**/algoss/alg7_kra/*.py
 **/call_archives
 
 **/analysis_*/

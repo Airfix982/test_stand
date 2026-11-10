@@ -343,7 +343,7 @@ def main():
     p.add_argument('--bind',default='0.0.0.0')
     p.add_argument('--port',type=int,default=19333)
     p.add_argument('--codec',choices=['pcm16','ulaw'],default='pcm16',help='UDP only. ulaw uses G.711 companding at 20k, NOT canonical 8k G.711')
-    p.add_argument('--tx-gain',type=float,default=.75)
+    p.add_argument('--tx-gain',type=float,default=1.95)
     p.add_argument('--guard-amp',type=float,default=.12)
     args=p.parse_args()
     if args.tx_gain<=0 or args.guard_amp<=0 or args.duration<0:p.error('invalid gain or duration')

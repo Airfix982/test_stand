@@ -15,6 +15,7 @@ import numpy as np
 from scipy.signal import resample_poly
 from scipy.fftpack import dct, idct
 from .frame_port import FrameCryptoPlugin, FrameContext, FRAME, check_batch, check_frame
+from .alg7_rx_enhance import StreamingIndexRepair, OutputDynamics
 
 _COMP = np.array([.800000011920929,.5,.4000000059604645,.28571000695228577,.22222000360488892,.18182000517845154,.14285999536514282,.11111000180244446,.2])
 _EBANDS = np.array([0,2,4,7,11,16,22,30,40], dtype=int)
@@ -171,6 +172,12 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
         self.directory, m = _load_module_tree(algo_dir)
         self.original_seed = int(seed)
         self.analyzer = m['speech_analyzer'].Speech_Analyzer_class(self.directory/'speech_model.npz', self.directory/'spherical_code.npz')
+        self.rx_repair = StreamingIndexRepair(self.analyzer.guard_low, self.analyzer.guard_high)
+        self.use_rx_repair = False
+        self._last_rx_index = None
+        self.use_adaptive_lpc = False
+        self.use_output_limiter = False
+        self.output_dynamics = OutputDynamics(peak_ceiling=0.93, target_rms=None)
         self.crypt = m['encryption'].Encryption_class(self.directory/'spherical_code.npz')
         self.ps = m['pseudo_speech'].Pseudospeech_Synthetizer_class(self.directory/'pseudospeech_model.npz', self.directory/'spherical_code.npz')
         self.PseudoState = m['pseudo_speech'].parameters_pseudospeech
@@ -257,6 +264,11 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
         self.dec_state.pitch_value = (self.ps.Fs/(2*np.pi))*self.f0.est(chunk,eps=2e-2)
         self.ps.value_to_index(self.dec_state)
         p,e,t = self._keyed(self.dec_state.pitch_index,self.dec_state.energy_index,self.dec_state.timbre_index,ctx.index,True)
+        if self._last_rx_index is not None and ctx.index != self._last_rx_index + 1:
+            self.rx_repair.reset()
+        self._last_rx_index = ctx.index
+        if self.use_rx_repair:
+            p, e = self.rx_repair.process(p, e)
         lo,span = float(self.analyzer.guard_low),float(self.analyzer.indices_range)
         pitch = float(self.analyzer.pitch_period_min) + ((float(p)-lo)/span)*(float(self.analyzer.pitch_period_max)-float(self.analyzer.pitch_period_min))
         energy = 10.0**(float(self.analyzer.energy_min) + ((float(e)-lo)/span)*(float(self.analyzer.energy_max)-float(self.analyzer.energy_min)))
@@ -266,12 +278,15 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
         cep = dct(np.log10(bands),type=2,norm='ortho')
         cep[0] -= 4.0
         lpc,g = _lpc_cep(cep)
-        y8 = self.synth.synthesize_frame(pitch,np.log10(max(float(g),1e-30)),lpc)
+        y8 = self.synth.synthesize_frame(pitch, np.log10(max(float(g), 1e-30)), lpc, timbre=direction if self.use_adaptive_lpc else None)
         y16 = resample_poly(np.asarray(y8,dtype=np.float64),2,1)
         if len(y16)!=320:
             raise RuntimeError('LPC synthesized %d samples, expected 320' % len(y16))
         # DirectLPC outputs in 16-bit PCM amplitude units; no per-frame AGC.
-        return np.clip(y16*self.output_gain/32768.0,-1.0,1.0).astype(np.float32)
+        out = np.nan_to_num(y16 * self.output_gain / 32768.0, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.use_output_limiter:
+            return self.output_dynamics.process(out)
+        return np.clip(out, -1.0, 1.0).astype(np.float32)
 
     def on_sync_event(self, event):
         # The transport owns PN detection; ALG7 never re-aligns with a clean TX reference.

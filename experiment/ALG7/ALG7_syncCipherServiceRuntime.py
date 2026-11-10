@@ -169,6 +169,8 @@ def tx(a):
 def rx(a):
     input_options(a)
     c=a.cipher(a.secret);root=Path(a.out).resolve();root.mkdir(parents=True,exist_ok=True)
+    if hasattr(c, 'configure_rx'):
+        c.configure_rx(repair=a.repair_indices, adaptive_lpc=a.adaptive_lpc, limiter=a.output_limiter, agc=a.output_agc)
     speaker=physical('sinks',a.speaker) if a.play else None
     stop=threading.Event();mode=[a.listen_mode];capture=player=None;sync=None
     gain_state=[1.0]; pn_bank=(np.asarray(makeGuardBank(WFS,GUARD,64),np.float32) if a.pn_gain_correction else None)
@@ -303,13 +305,17 @@ def main(cipher,name,default_scenario='call'):
     p.add_argument('--listen-mode',choices=['raw','correct','wrong'],default='correct')
     p.add_argument('--wrong-shift',type=int,default=64)
     p.add_argument('--index-offset',type=int,default=0,help='RX: absolute frame offset; use for delayed streams if known')
-    p.add_argument('--payload-gain',type=float,default=1.)
-    p.add_argument('--guard-amp',type=float,default=.12)
+    p.add_argument('--payload-gain',type=float,default=0.75)
+    p.add_argument('--guard-amp',type=float,default=.08)
     p.add_argument('--pn-gain-correction',action='store_true',help='RX only: compensate gain using known PN guard, NO TX clean reference')
     p.add_argument('--mic');p.add_argument('--speaker')
     p.add_argument('--no-play',action='store_false',dest='play',help='RX do not play into physical speakers')
     p.add_argument('--duration',type=float,default=0.)
     p.add_argument('--out',default='/tmp/nears_service_'+name)
+    p.add_argument('--repair-indices', action='store_true')
+    p.add_argument('--adaptive-lpc', action='store_true')
+    p.add_argument('--output-limiter', action='store_true')
+    p.add_argument('--output-agc', action='store_true')
     a=p.parse_args();a.name=name
     try: int(a.secret)
     except ValueError: p.error('ALG7 requires integer seed (e.g. --secret 37)')
