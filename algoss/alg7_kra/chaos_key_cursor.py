@@ -27,7 +27,7 @@ class ChaosKeyCursor:
             raise ValueError("max_skip_frames must be nonnegative")
 
         # Exactly one initialized and warmed oscillator per cursor lifetime.
-        self._chaos = ChaosSystem(warmup=warmup, k=k, S=seed, beta=beta)
+        self._chaos = ChaosSystem(warmup=warmup, k=k, secret=seed, beta=beta)
         self.next_index = 0
         self._cache = OrderedDict()  # frame index -> packed key bytes
 

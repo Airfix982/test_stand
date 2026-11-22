@@ -169,7 +169,7 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
     name = 'alg7_kra'
     encode_batch_size = 4  # Unmodified speech_encoder processes four 20-ms speech frames.
 
-    def __init__(self, algo_dir, seed=37, synth_seed=12345, output_gain=1.0):
+    def __init__(self, algo_dir, seed=4444, synth_seed=12345, output_gain=1.0):
         self.directory, m = _load_module_tree(algo_dir)
         self.original_seed = int(seed)
         self.analyzer = m['speech_analyzer'].Speech_Analyzer_class(self.directory/'speech_model.npz', self.directory/'spherical_code.npz')
@@ -201,7 +201,7 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
         self.rot = np.exp(-1j*2*np.pi*np.arange(self.ps.band_num)/self.ps.band_num)
         self.bits_per_frame = int(self.crypt.encryption_bits[2])
         # self._key_cursor = OriginalNumpyRngCursor(self.original_seed, self.bits_per_frame)
-        self._key_cursor = ChaosKeyCursor(seed=self.original_seed, bits_per_frame=self.bits_per_frame, cache_frames=256)
+        self._key_cursor = ChaosKeyCursor(seed=self.original_seed, warmup=4444, k=66.0, beta=1.44,bits_per_frame=self.bits_per_frame, cache_frames=256)
         self.output_gain = float(output_gain)
         if int(self.ps.Fs)!=16000 or int(self.ps.flng)!=240 or int(self.ps.glng)!=80 or int(self.ps.flng+self.ps.glng)!=320 or int(self.analyzer.speech_frame_size)!=160:
             raise ValueError('ALG7 needs analyzer 8k/160 and pseudo speech Fs=16000, flng=240, glng=80; got speech_frame=%s, Fs=%s, flng=%s, glng=%s' % (self.analyzer.speech_frame_size, self.ps.Fs, self.ps.flng, self.ps.glng))
