@@ -8,7 +8,7 @@ from scipy.interpolate import CubicSpline
 import base64
 import json
 from scipy.signal import find_peaks
-import script.utils as utils
+import algoss.script.utils as utils
 import importlib
 
 
@@ -389,7 +389,7 @@ def decrypt_matrix_rows(mat, ks_mat, meta, itr, mode, emd_max_imfs, emd_max_sift
                         ks_mat[i, :],
                         meta,
                         mode=mode,
-                        mantissa_bits_to_xor=12
+                        mantissa_bits_to_xor=20
                     )
             sig_dec = reconstruct_from_imfs_and_residue(imfs, residue)
             new_mat[i, :] = sig_dec
@@ -522,7 +522,12 @@ def decrypt_signal(samples, meta, chunk_size, row_len, itr, mode, emd_max_imfs, 
 
 
 
-def test_5_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None):
+def test_5_run(org, enc, dec, errored_enc=None, org_format=None,
+               new_format=None, codec=None, bitrate=None):
+    # ONLY WAV/codec transport is modified. EMD cipher functions remain unchanged.
+    import subprocess
+    from pathlib import Path
+
     chunk_size = 2048
     row_len = 2048
     itr = 1
@@ -531,46 +536,113 @@ def test_5_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None
     master_seed = 0x123456789ABCDEF0
 
     samples, meta = read_wav_mono(org)
+    Path(enc).parent.mkdir(parents=True, exist_ok=True)
+    Path(dec).parent.mkdir(parents=True, exist_ok=True)
+    Path(dec).unlink(missing_ok=True)  # Do not mistake an older dec.wav for a successful run.
 
     encrypted = encrypt_signal(
-        samples=samples,
-        meta=meta,
-        chunk_size=chunk_size,
-        row_len=row_len,
-        itr=itr,
-        mode=mode,
-        emd_max_imfs=emd_max_imfs,
-        master_seed=master_seed
+        samples=samples, meta=meta, chunk_size=chunk_size,
+        row_len=row_len, itr=itr, mode=mode,
+        emd_max_imfs=emd_max_imfs, master_seed=master_seed,
     )
     write_wav_mono(enc, encrypted, meta)
+    # No use of original samples after this line; no match_rms(samples, decrypted).
+    del samples
 
     if errored_enc is not None:
         me.make_err(enc, errored_enc)
         enc = errored_enc
 
-    print("before conversion md5:", file_md5(enc))
-    if org_format is not None and new_format is not None:
-        me.emulate_format_convertion(enc, org_format, new_format)
-        # enc = enc+"."+str(new_format)
-    print("after conversion md5:", file_md5(enc))
+    input_for_decrypt = str(enc)
+    if new_format is not None:
+        fmt = str(new_format).lower().lstrip('.')
+        if fmt not in ('mp3', 'ogg', 'opus'):
+            raise ValueError('new_format must be None, mp3, ogg or opus')
+        use_opus = fmt in ('ogg', 'opus')
+        if codec is not None and str(codec).lower() not in (
+            ('opus', 'libopus', 'ogg') if use_opus else ('mp3', 'libmp3lame')
+        ):
+            raise ValueError('codec and new_format disagree')
+        br = str(bitrate or ('96k' if use_opus else '128k'))
+        codec_file = str(enc) + ('.ogg' if use_opus else '.mp3')
+        decoded_file = str(Path(enc).with_name(Path(enc).stem +
+                          ('_opus_decoded.wav' if use_opus else '_mp3_decoded.wav')))
+        encode_opts = (['-ar', '48000', '-c:a', 'libopus', '-application', 'audio']
+                       if use_opus else ['-ar', '44100', '-c:a', 'libmp3lame'])
+        subprocess.run([
+            'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-i', str(enc), '-map', '0:a:0', '-vn', '-ac', '1',
+            *encode_opts, '-b:a', br, codec_file,
+        ], check=True)
+        pcm_codec = {1: 'pcm_u8', 2: 'pcm_s16le', 4: 'pcm_s32le'}.get(meta['sample_width_bytes'])
+        if pcm_codec is None:
+            raise ValueError('unsupported source PCM width')
+        subprocess.run([
+            'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-i', codec_file, '-map', '0:a:0', '-vn', '-ac', '1',
+            '-ar', str(meta['sample_rate']), '-c:a', pcm_codec, decoded_file,
+        ], check=True)
+        input_for_decrypt = decoded_file
+        print('ALG5 codec:', enc, '->', codec_file, '->', decoded_file, flush=True)
 
-    enc_samples, enc_meta = read_wav_mono(enc)
+    enc_samples, enc_meta = read_wav_mono(input_for_decrypt)
+    if (enc_meta['sample_rate'] != meta['sample_rate'] or
+            enc_meta['sample_width_bytes'] != meta['sample_width_bytes']):
+        raise ValueError('codec did not restore original PCM rate/width')
+    expected_len = len(encrypted)
+    actual_len = len(enc_samples)
+    delta = actual_len - expected_len
+
+    if delta != 0:
+        max_delta = max(
+            32, int(round(meta["sample_rate"] * 0.005))
+        )
+
+        if new_format is None or abs(delta) > max_delta:
+            raise ValueError(
+                f"ALG5: unexpected sample count: "
+                f"{expected_len} -> {actual_len}"
+            )
+
+        if delta > 0:
+            enc_samples = enc_samples[:expected_len]
+        else:
+            silence = 128 if meta["sample_width_bytes"] == 1 else 0
+            enc_samples = np.pad(
+                enc_samples,
+                (0, -delta),
+                mode="constant",
+                constant_values=silence
+            )
+
+        print(
+            f"ALG5: codec length aligned {delta:+d} samples",
+            flush=True
+        )
+
+    if new_format is not None:
+        changed = int(np.count_nonzero(enc_samples != encrypted))
+        print('ALG5 encrypted samples changed by codec: %d/%d' %
+              (changed, len(encrypted)), flush=True)
+        if not changed:
+            raise RuntimeError('codec round-trip had no effect on ciphertext')
+    del encrypted
+    if new_format is not None:
+        Path(enc).replace(
+            Path(enc).with_name("org_" + Path(enc).name)
+        )
+        write_wav_mono(enc, enc_samples, enc_meta)
+        Path(decoded_file).unlink(missing_ok=True)
 
     decrypted = decrypt_signal(
-        samples=enc_samples,
-        meta=enc_meta,
-        chunk_size=chunk_size,
-        row_len=row_len,
-        itr=itr,
-        mode=mode,
-        emd_max_imfs=emd_max_imfs,
-        master_seed=master_seed
+        samples=enc_samples, meta=enc_meta, chunk_size=chunk_size,
+        row_len=row_len, itr=itr, mode=mode,
+        emd_max_imfs=emd_max_imfs, master_seed=master_seed,
     )
-
-    decrypted = match_rms(samples, decrypted)
+    # Never correct the result using source PCM; output is solely decrypted data.
     decrypted = clip_to_pcm_range(decrypted, enc_meta)
-
     write_wav_mono(dec, decrypted, enc_meta)
+
 
     # diff = samples.astype(np.int64) - decrypted.astype(np.int64)
 

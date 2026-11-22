@@ -16,6 +16,7 @@ from scipy.signal import resample_poly
 from scipy.fftpack import dct, idct
 from .frame_port import FrameCryptoPlugin, FrameContext, FRAME, check_batch, check_frame
 from .alg7_rx_enhance import StreamingIndexRepair, OutputDynamics
+from algoss.alg7_kra.chaos_key_cursor import ChaosKeyCursor
 
 _COMP = np.array([.800000011920929,.5,.4000000059604645,.28571000695228577,.22222000360488892,.18182000517845154,.14285999536514282,.11111000180244446,.2])
 _EBANDS = np.array([0,2,4,7,11,16,22,30,40], dtype=int)
@@ -199,7 +200,8 @@ class Alg7KraAdaptor(FrameCryptoPlugin):
         self.f0 = self.pitch_estimator_class(self.ps.flng,self.ps.harm_num_max,bounds)
         self.rot = np.exp(-1j*2*np.pi*np.arange(self.ps.band_num)/self.ps.band_num)
         self.bits_per_frame = int(self.crypt.encryption_bits[2])
-        self._key_cursor = OriginalNumpyRngCursor(self.original_seed, self.bits_per_frame)
+        # self._key_cursor = OriginalNumpyRngCursor(self.original_seed, self.bits_per_frame)
+        self._key_cursor = ChaosKeyCursor(seed=self.original_seed, bits_per_frame=self.bits_per_frame, cache_frames=256)
         self.output_gain = float(output_gain)
         if int(self.ps.Fs)!=16000 or int(self.ps.flng)!=240 or int(self.ps.glng)!=80 or int(self.ps.flng+self.ps.glng)!=320 or int(self.analyzer.speech_frame_size)!=160:
             raise ValueError('ALG7 needs analyzer 8k/160 and pseudo speech Fs=16000, flng=240, glng=80; got speech_frame=%s, Fs=%s, flng=%s, glng=%s' % (self.analyzer.speech_frame_size, self.ps.Fs, self.ps.flng, self.ps.glng))

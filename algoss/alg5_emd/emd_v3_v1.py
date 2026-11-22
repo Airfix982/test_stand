@@ -523,7 +523,9 @@ def decrypt_signal(samples, meta, chunk_size, row_len, itr, mode, emd_max_imfs, 
 
 
 
-def test_5_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None):
+def test_5_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None, 
+    codec=None,
+    bitrate=None):
     chunk_size = 2048
     row_len = 2048
     itr = 1
@@ -551,7 +553,7 @@ def test_5_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None
 
     print("before conversion md5:", file_md5(enc))
     if org_format is not None and new_format is not None:
-        me.emulate_format_convertion(enc, org_format, new_format)
+        me.emulate_format_convertion(enc, org_format, new_format, codec, bitrate)
         # enc = enc+"."+str(new_format)
     print("after conversion md5:", file_md5(enc))
 

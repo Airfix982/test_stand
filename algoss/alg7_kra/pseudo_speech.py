@@ -39,8 +39,8 @@ class Pseudospeech_Synthetizer_class:
 
 
 		reloaded_code = np.load(spherical_code_file)
-		self.c_0 = reloaded_code["c_0"]
-		self.u_0 = reloaded_code["u_0"]
+		self.c_0 = np.asarray(reloaded_code["c_0"], dtype=np.float64).reshape(-1)
+		self.u_0 = np.asarray(reloaded_code["u_0"], dtype=np.float64).reshape(-1)
 		self.order_bits = reloaded_code['order_bits']
 		self.G_dim_half = len(self.order_bits)
 		self.G_dim = self.G_dim_half*2

@@ -3,7 +3,8 @@ import numpy as np
 from scipy.io import wavfile
 import pywt
 import matplotlib.pyplot as plt
-import script.utils as utils
+import algoss.script.utils as utils
+from algoss.script.codec_transport import codec_roundtrip_inplace
 import importlib
 
 
@@ -107,6 +108,7 @@ def encrypt_wav_realtime_like(input_wav: str, encrypted_wav: str, xor_keys: np.n
         print(f"[warn] input rate={fs}, orig rate={RATE}")
 
     data = wav_to_int32_mono(samples)
+    data //= 2
 
     curr_key_idx = 0
     out_blocks = []
@@ -201,7 +203,9 @@ def decrypt_wav_realtime_like(encrypted_wav: str, decrypted_wav: str, xor_keys: 
 
 
 
-def test_2_run(org, enc, dec, secret1 = 444444444444444, secret2 = 555555555555555, secret3 = 666666666666666, errored_enc=None, org_format=None, new_format=None):
+def test_2_run(org, enc, dec, secret1 = 444444444444444, secret2 = 555555555555555, secret3 = 666666666666666, errored_enc=None, org_format=None, new_format=None, 
+    codec=None,
+    bitrate=None):
     # org = "test2/artefacts/input.wav"
     # enc = "test2/artefacts/encrypted.wav"
     # dec = "test2/artefacts/decrypted.wav"
@@ -213,7 +217,7 @@ def test_2_run(org, enc, dec, secret1 = 444444444444444, secret2 = 5555555555555
         ChaosKeys(min_len, max_len, mod, secret1, secret2, secret3).generage_keys(),
         dtype=np.uint8
     )
-    emulate_real_time = True
+    emulate_real_time = False
 
     org_len = encrypt_wav_realtime_like(org, enc, xor_keys, emulate_realtime=emulate_real_time)
 
@@ -221,8 +225,9 @@ def test_2_run(org, enc, dec, secret1 = 444444444444444, secret2 = 5555555555555
         me.make_err(enc, errored_enc)
         enc = errored_enc
 
-    if org_format is not None and new_format is not None:
-        me.emulate_format_convertion(enc, org_format, new_format)
+    codec_roundtrip_inplace(enc, new_format, bitrate)
+    # if org_format is not None and new_format is not None:
+    #     me.emulate_format_convertion(enc, org_format, new_format, codec, bitrate)
         # enc = enc+"."+str(new_format)
     # secret1 = 444444444444444
     # secret2 = 555555555555555

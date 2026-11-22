@@ -5,7 +5,7 @@ import base64
 import struct
 import hashlib
 from typing import Dict, List, Tuple
-import script.utils as utils
+import algoss.script.utils as utils
 import importlib
 
 
@@ -60,13 +60,37 @@ def derive_key1_key2(secret: str, chunk_index: int) -> Tuple[float, float]:
 
 
 def read_wav_mono(path: str) -> Tuple[np.ndarray, Dict]:
-    with wave.open(path, "rb") as f:
-        n_channels = f.getnchannels()
-        sampwidth = f.getsampwidth()
-        framerate = f.getframerate()
-        n_frames = f.getnframes()
-        comptype = f.getcomptype()
-        raw = f.readframes(n_frames)
+    try:
+        with wave.open(path, "rb") as f:
+            n_channels = f.getnchannels()
+            sampwidth = f.getsampwidth()
+            framerate = f.getframerate()
+            n_frames = f.getnframes()
+            comptype = f.getcomptype()
+            raw = f.readframes(n_frames)
+    except wave.Error as exc:
+        # Python 3.10 wave cannot read WAVE_FORMAT_EXTENSIBLE (format tag 65534).
+        # ffmpeg produces this WAV header when decoding as pcm_s32le.
+        # Read exact signed PCM32 words; do not convert them through float audio.
+        if "unknown format: 65534" not in str(exc):
+            raise
+        import soundfile as sf
+        info = sf.info(path)
+        if info.channels != 1 or info.subtype != "PCM_32":
+            raise ValueError(
+                f"Expected mono PCM32 WAVE_FORMAT_EXTENSIBLE, got "
+                f"channels={info.channels}, subtype={info.subtype}"
+            ) from exc
+        arr, framerate = sf.read(path, dtype="int32", always_2d=False)
+        meta = {
+            "sample_rate": framerate,
+            "sample_width_bytes": 4,
+            "bits_per_sample": 32,
+            "min_value": -(1 << 31),
+            "max_value": (1 << 31) - 1,
+            "dtype_name": "int32",
+        }
+        return arr.astype(np.int64), meta
 
     if comptype != "NONE":
         raise ValueError("Only uncompressed PCM WAV is supported")
@@ -725,6 +749,99 @@ def decrypt_signal(encrypted_pcm: np.ndarray, meta: Dict) -> np.ndarray:
     return decrypted_pcm
 
 
+
+def decrypt_signal_codec_fallback(encrypted_pcm: np.ndarray, meta: Dict) -> np.ndarray:
+    """Best-effort decoding of codec-damaged words; original decrypt_chunk unchanged."""
+    encrypted_signed = np.asarray(encrypted_pcm, dtype=np.int64)
+    chunks = split_into_power2_chunks_no_pad(encrypted_signed, CHUNK_SIZE)
+    decoded_chunks = []
+    repaired_chunks = 0
+    invalid_coeffs = 0
+    clipped_coeffs = 0
+    silent_chunks = 0
+
+    for idx, chunk in enumerate(chunks):
+        try:
+            # Сначала пробуем оригинальное дешифрование без изменений.
+            recovered = decrypt_chunk(chunk, meta, idx)
+
+        except (ValueError, FloatingPointError, OverflowError):
+            try:
+                n = len(chunk)
+                key1, key2 = derive_key1_key2(META_SECRET, idx)
+                key_norm, _ = build_key_norm_from_key1_key2(key1, key2, n)
+
+                if not np.isfinite(key_norm).all():
+                    raise ValueError("nonfinite keystream")
+
+                # Тот же XOR, что в исходном decrypt_chunk.
+                cipher_words = int32_container_to_uint32_words(chunk)
+                key_words = float32_array_to_uint32_words(key_norm)
+                coefficient_words = np.bitwise_xor(cipher_words, key_words)
+
+                # NaN/Inf убираем ДО преобразования битов в float32.
+                invalid = (
+                    (coefficient_words & np.uint32(0x7F800000))
+                    == np.uint32(0x7F800000)
+                )
+
+                invalid_coeffs += int(np.count_nonzero(invalid))
+                coefficient_words[invalid] = np.uint32(0)
+
+                coefficients = uint32_words_to_float32_array(
+                    coefficient_words
+                ).astype(np.float64)
+
+                # Ограничиваем только слишком большие коэффициенты.
+                bound = float(1 << (8 * meta["sample_width_bytes"] - 1))
+
+                oversize = np.abs(coefficients) > bound
+                clipped_coeffs += int(np.count_nonzero(oversize))
+
+                coefficients = np.clip(coefficients, -bound, bound)
+
+                # Исходные обратная перестановка и IFWHT.
+                perm = build_permutation(n, idx)
+                inv = invert_permutation(perm)
+
+                restored = ifwht_inplace_float(coefficients[inv])
+                restored = np.rint(restored)
+
+                # Не допускаем переполнения PCM.
+                restored = np.clip(restored, -bound, bound - 1)
+                recovered = restored.astype(np.int64)
+
+                repaired_chunks += 1
+
+            except (ValueError, FloatingPointError, OverflowError) as error:
+                print(
+                    f"ALG6 unrecoverable chunk={idx}: {error}",
+                    flush=True
+                )
+                recovered = np.zeros(len(chunk), dtype=np.int64)
+                silent_chunks += 1
+
+        decoded_chunks.append(recovered)
+
+    result = (
+        np.concatenate(decoded_chunks)
+        if decoded_chunks
+        else np.empty(0, dtype=np.int64)
+    )
+
+    print(
+        f"ALG6 codec salvage: "
+        f"repaired_chunks={repaired_chunks}/{len(chunks)}, "
+        f"invalid_coeffs={invalid_coeffs}, "
+        f"clipped_coeffs={clipped_coeffs}, "
+        f"unrecoverable_chunks={silent_chunks}, "
+        f"nonzero_samples={np.count_nonzero(result)}/{len(result)}",
+        flush=True
+    )
+
+    return centered_signed_to_pcm(result, meta)
+
+
 def build_cipher_meta_from_plain_meta(meta: Dict) -> Dict:
     return {
         "sample_rate": meta["sample_rate"],
@@ -736,20 +853,105 @@ def build_cipher_meta_from_plain_meta(meta: Dict) -> Dict:
     }
 
 
-def test_6_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None):
+def test_6_run(org, enc, dec, errored_enc=None, org_format=None,
+               new_format=None, codec=None, bitrate=None):
+    # ONLY WAV/codec transport is modified. WHT encryption/decryption is unchanged.
+    import subprocess
+    from pathlib import Path
+
     samples_pcm, meta = read_wav_mono(org)
+    Path(enc).parent.mkdir(parents=True, exist_ok=True)
+    Path(dec).parent.mkdir(parents=True, exist_ok=True)
+    Path(dec).unlink(missing_ok=True)  # Do not keep a stale "successful" dec.wav.
 
     encrypted_container = encrypt_signal(samples_pcm, meta)
-
     cipher_meta = build_cipher_meta_from_plain_meta(meta)
     write_wav_mono(enc, encrypted_container, cipher_meta)
 
-    if org_format is not None and new_format is not None:
-        me.emulate_format_convertion(enc, org_format, new_format)
-        # enc = enc+"."+str(new_format)
+    input_for_decrypt = str(enc)
+    if new_format is not None:
+        fmt = str(new_format).lower().lstrip('.')
+        if fmt not in ('mp3', 'ogg', 'opus'):
+            raise ValueError('new_format must be None, mp3, ogg or opus')
+        use_opus = fmt in ('ogg', 'opus')
+        if codec is not None and str(codec).lower() not in (
+            ('opus', 'libopus', 'ogg') if use_opus else ('mp3', 'libmp3lame')
+        ):
+            raise ValueError('codec and new_format disagree')
+        br = str(bitrate or ('96k' if use_opus else '128k'))
+        codec_file = str(enc) + ('.ogg' if use_opus else '.mp3')
+        decoded_file = str(Path(enc).with_name(Path(enc).stem +
+                          ('_opus_decoded.wav' if use_opus else '_mp3_decoded.wav')))
+        encode_opts = (['-ar', '48000', '-c:a', 'libopus', '-application', 'audio']
+                       if use_opus else ['-ar', '44100', '-c:a', 'libmp3lame'])
+        subprocess.run([
+            'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-i', str(enc), '-map', '0:a:0', '-vn', '-ac', '1',
+            *encode_opts, '-b:a', br, codec_file,
+        ], check=True)
+        # ALG6 stores encrypted float32 bit patterns as signed int32 PCM words.
+        subprocess.run([
+            'ffmpeg', '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-i', codec_file, '-map', '0:a:0', '-vn', '-ac', '1',
+            '-ar', str(cipher_meta['sample_rate']),
+            '-c:a', 'pcm_s32le', decoded_file,
+        ], check=True)
+        input_for_decrypt = decoded_file
+        print('ALG6 codec:', enc, '->', codec_file, '->', decoded_file, flush=True)
 
-    enc_pcm_2, enc_meta = read_wav_mono(enc)
+    enc_pcm_2, enc_meta = read_wav_mono(input_for_decrypt)
+    if (enc_meta['sample_rate'] != cipher_meta['sample_rate'] or
+            enc_meta['sample_width_bytes'] != 4):
+        raise ValueError('ALG6 codec WAV must be same-rate PCM32')
+    
+    expected_len = len(encrypted_container)
+    actual_len = len(enc_pcm_2)
+    delta = actual_len - expected_len
 
-    decrypted_pcm = decrypt_signal(enc_pcm_2, meta)
+    if delta != 0:
+        max_delta = max(
+            32, int(round(cipher_meta["sample_rate"] * 0.005))
+        )
 
+        if new_format is None or abs(delta) > max_delta:
+            raise ValueError(
+                f"ALG6: unexpected sample count: "
+                f"{expected_len} -> {actual_len}"
+            )
+
+        if delta > 0:
+            enc_pcm_2 = enc_pcm_2[:expected_len]
+        else:
+            enc_pcm_2 = np.pad(
+                enc_pcm_2,
+                (0, -delta),
+                mode="constant"
+            )
+
+        print(
+            f"ALG6: codec length aligned {delta:+d} samples",
+            flush=True
+        )
+
+    if new_format is not None:
+        changed = int(np.count_nonzero(enc_pcm_2 != encrypted_container))
+        print('ALG6 encrypted words changed by codec: %d/%d' %
+              (changed, len(encrypted_container)), flush=True)
+        if not changed:
+            raise RuntimeError('codec round-trip had no effect on ciphertext')
+    del encrypted_container, samples_pcm
+    if new_format is not None:
+        Path(enc).replace(
+            Path(enc).with_name("org_" + Path(enc).name)
+        )
+        write_wav_mono(enc, enc_pcm_2, enc_meta)
+        Path(decoded_file).unlink(missing_ok=True)
+
+    # Only the lossy-codec test path uses the protective fallback.
+    # With no codec the original decrypt_signal remains unchanged.
+    if new_format is None:
+        decrypted_pcm = decrypt_signal(enc_pcm_2, meta)
+    else:
+        decrypted_pcm = decrypt_signal_codec_fallback(enc_pcm_2, meta)
     write_wav_mono(dec, decrypted_pcm, meta)
+

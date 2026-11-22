@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
+from tempfile import TemporaryDirectory
 from pathlib import Path
 
 # import script.utils as me
@@ -19,6 +20,7 @@ from .pseudo_speech import Pseudospeech_Synthetizer_class, parameters_pseudospee
 from .encryption import Encryption_class
 from .speech_analyzer import Speech_Analyzer_class
 from .DirectLPCSynthesizer import DirectLPCSynthesizer
+from .chaos_system import ChaosSystem
 
 BASE_DIR = Path(__file__).resolve().parent
 SEED = 37
@@ -72,9 +74,18 @@ def resample_audio(x, src_rate, dst_rate):
 
 
 def analyze_whole(samples_8k):
-    (BASE_DIR / "temp").mkdir(exist_ok=True)
-    with workdir(BASE_DIR):
-        return my_analyzer.analyze_speech(samples_8k)
+    # The native encoder uses fixed filenames from speech_analyzer.TEMP_DIR.
+    # A unique temporary directory per call prevents collisions between
+    # joblib/loky workers. It is removed immediately after analysis.
+    from . import speech_analyzer as _speech_analyzer
+    previous_dir = _speech_analyzer.TEMP_DIR
+    with TemporaryDirectory(prefix="alg7_encoder_") as tmp_dir:
+        _speech_analyzer.TEMP_DIR = Path(tmp_dir)
+        try:
+            with workdir(BASE_DIR):
+                return my_analyzer.analyze_speech(samples_8k)
+        finally:
+            _speech_analyzer.TEMP_DIR = previous_dir
 
 
 def pad_for_encoder(samples_8k):
@@ -313,9 +324,12 @@ def encrypt_wav(input_path, output_path, seed=SEED):
     original_len = len(samples_8k)
     padded, _ = pad_for_encoder(samples_8k)
     p, e, t, _, _, _ = analyze_whole(padded)
-    rng, state, frames = np.random.default_rng(seed), new_pseudo_state(), []
+    # rng, state, frames = np.random.default_rng(seed), new_pseudo_state(), []
+    chaos = ChaosSystem()
+    state, frames  = new_pseudo_state(), []
     for i in range(len(p)):
-        key = rng.integers(0, 2, size=KEY_BITS_PER_FRAME, dtype=np.uint8)
+        # key = rng.integers(0, 2, size=KEY_BITS_PER_FRAME, dtype=np.uint8)
+        key = chaos.next_bits(KEY_BITS_PER_FRAME)
         pe, ee, te = encrypt_frame(p[i], e[i], t[:, i], key)
         frames.append(my_ps.synthetize_frame(pe, ee, te, state))
     enc = np.concatenate(frames).astype(np.int16)
@@ -332,12 +346,15 @@ def decrypt_wav(input_path, output_path, ref, original_len, seed=SEED):
     frame_len = int(my_ps.flng + my_ps.glng)
     need = n * frame_len
     enc = np.pad(enc, (0, max(0, need - len(enc))))[:need]
-    rng, state, f0 = np.random.default_rng(seed), new_pseudo_state(), new_f0()
+    # rng, state, f0 = np.random.default_rng(seed), new_pseudo_state(), new_f0()
+    chaos = ChaosSystem()
+    state, f0 = new_pseudo_state(), new_f0()
     pd = np.zeros(n); ed = np.zeros(n); td = np.zeros((8, n))
     for i in range(n):
         frame = enc[i * frame_len:(i + 1) * frame_len]
         pr, er, tr = analyze_pseudo_frame(frame, f0, state)
-        key = rng.integers(0, 2, size=KEY_BITS_PER_FRAME, dtype=np.uint8)
+        # key = rng.integers(0, 2, size=KEY_BITS_PER_FRAME, dtype=np.uint8)
+        key = chaos.next_bits(KEY_BITS_PER_FRAME)
         pd[i], ed[i], td[:, i] = decrypt_frame(pr, er, tr, key)
     compare_indices(ref, (pd, ed, td), f"RAW AFTER DECRYPT {Path(input_path).name}")
     pd, ed, td = repair_decoded_indices(pd, ed, td)
@@ -494,30 +511,94 @@ def test_7_run(
     errored_enc=None,
     org_format=None,
     new_format=None,
+    codec=None,
+    bitrate="48k",
+    codec_bitrate=None,
+    seed=4444,
 ):
-    print("V2")
-    seed = 4444
-    enc = Path(enc)
-    dec = Path(dec)
+    """Local ALG7: original WAV -> encrypted WAV -> optional codec -> decrypt.
 
-    original_len, ref = encrypt_wav(org, enc, seed)
+    Saves AUDIO only, preserving every codec stage. Supports joblib/loky
+    process parallelism with unique org/enc/dec paths.
+    """
+    import re
 
-    if new_format is None:
-        decrypt_wav(enc, dec, ref, original_len, seed)
+    if errored_enc is not None:
+        raise ValueError("errored_enc is not used in ALG7 local pipeline")
+    if org_format is not None and str(org_format).lower().lstrip(".") != "wav":
+        raise ValueError("ALG7 expects WAV input")
+    org, enc, dec = Path(org), Path(enc), Path(dec)
+    if not org.is_file():
+        raise FileNotFoundError(str(org))
+    if len({org.resolve(), enc.resolve(), dec.resolve()}) != 3:
+        raise ValueError("Input, encrypted and decrypted paths must differ")
+    if enc.suffix.lower() != ".wav" or dec.suffix.lower() != ".wav":
+        raise ValueError("enc and dec paths must end in .wav")
+    enc.parent.mkdir(parents=True, exist_ok=True)
+    dec.parent.mkdir(parents=True, exist_ok=True)
+
+    fmt = str(new_format).lower().lstrip(".") if new_format is not None else "none"
+    if fmt in ("none", "", "wav"):
+        selected_codec = None
+    elif fmt == "mp3":
+        selected_codec = "mp3"
+    elif fmt in ("ogg", "opus"):
+        selected_codec = "opus"
+    else:
+        raise ValueError("new_format must be None, 'mp3', or 'ogg'")
+
+    if selected_codec and codec is not None:
+        named_codec = "opus" if str(codec).lower() in ("opus", "ogg") else str(codec).lower()
+        if named_codec != selected_codec:
+            raise ValueError("codec and new_format disagree: %r vs %r" % (codec, new_format))
+
+    chosen_bitrate = str(codec_bitrate or bitrate or "48k").lower()
+    if selected_codec and not re.fullmatch(r"[1-9][0-9]*k", chosen_bitrate):
+        raise ValueError("bitrate must be like '64k', '96k', '320k'")
+
+    # The original algorithm returns its in-memory reference indices.
+    # These are used internally by decrypt_wav(), never written to disk.
+    original_len, ref = encrypt_wav(str(org), str(enc), seed=int(seed))
+
+    if selected_codec is None:
+        decrypt_wav(str(enc), str(dec), ref, original_len, seed=int(seed))
         return
 
-    if new_format.lower() in ("ogg", "opus"):
-        enc_raw = enc.with_name(enc.stem + "_opus_raw.wav")
-        enc_aligned = enc.with_name(enc.stem + "_opus_aligned.wav")
+    original_enc = enc.with_name("org_" + enc.name)
+    enc.replace(original_enc)
 
-        opus_roundtrip_ffmpeg(enc, enc_raw, "48k")
-        align_codec_output(enc, enc_raw, enc_aligned)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg not found")
 
-        # Исправление: дешифруем обработанный файл.
-        decrypt_wav(enc_aligned, dec, ref, original_len, seed)
-        return
+    extension = ".mp3" if selected_codec == "mp3" else ".ogg"
+    compressed = Path(str(enc) + extension)  # enc1.wav.mp3 / enc1.wav.ogg
+    raw = enc.with_name(enc.stem + "_" + selected_codec + "_raw.wav")
+    aligned = enc
+    # aligned = enc.with_name(enc.stem + "_" + selected_codec + "_aligned.wav")
 
-    raise ValueError(f"Unsupported format: {new_format}")
+    codec_args = (
+        ["-ar", "44100", "-c:a", "libmp3lame", "-b:a", chosen_bitrate]
+        if selected_codec == "mp3" else
+        ["-ar", "48000", "-c:a", "libopus", "-application", "voip",
+         "-vbr", "off", "-b:a", chosen_bitrate]
+    )
+    subprocess.run([
+        ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", str(original_enc), "-map", "0:a:0", "-vn", "-ac", "1",
+        *codec_args, str(compressed)
+    ], check=True)
+    subprocess.run([
+        ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", str(compressed), "-map", "0:a:0", "-vn", "-ac", "1",
+        "-ar", "16000", "-c:a", "pcm_s16le", str(raw)
+    ], check=True)
+
+    # The original local alignment uses clean enc.wav as reference.
+    # The codec-processed WAV, not clean enc.wav, is sent to decrypt_wav().
+    align_codec_output(str(original_enc), str(raw), str(aligned))
+    raw.unlink(missing_ok=True)
+    decrypt_wav(str(aligned), str(dec), ref, original_len, seed=int(seed))
 
 if __name__ == "__main__":
     main()

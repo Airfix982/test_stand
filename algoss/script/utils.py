@@ -34,12 +34,12 @@ def make_err(org, err):
     bytes_2[0] ^= 0b00010000
     save_wav_bytes((fs, bytes_2), err)
 
-def emulate_format_convertion(path, org_format, new_format):
+def emulate_format_convertion(path, org_format, new_format, codec, bitrate):
     # 64 128 320 mp3
 
     # 16 48 96 opus
-    bitrate="96k"
-    codec="libopus"
+    # bitrate="96k"
+    # codec="libopus"
     # print("codec " + codec + " bitrate " + bitrate)
     print("convert from " + org_format + " to " + new_format)
     new_path = path+"."+str(new_format)

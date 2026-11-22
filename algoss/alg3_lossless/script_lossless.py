@@ -7,7 +7,8 @@ import importlib
 
 
 
-import script.utils as utils
+import algoss.script.utils as utils
+from algoss.script.codec_transport import codec_roundtrip_inplace
 importlib.reload(utils)
 me = utils
 
@@ -294,7 +295,9 @@ def test_3_run(
     dec,
     secret="nothing to see here",
     chunk_samples=4096,
-    output_dtype="int16", org_format=None, new_format=None
+    output_dtype="int16", org_format=None, new_format=None, 
+    codec=None,
+    bitrate=None
 ):
     encrypt_wav_chebyshev_realtime(
         input_wav_path=org,
@@ -303,9 +306,9 @@ def test_3_run(
         chunk_samples=chunk_samples,
     )
     
-
-    if org_format is not None and new_format is not None:
-        me.emulate_format_convertion(enc, org_format, new_format)
+    codec_roundtrip_inplace(enc, new_format, bitrate)
+    # if org_format is not None and new_format is not None:
+    #     me.emulate_format_convertion(enc, org_format, new_format, codec, bitrate)
         # enc = enc+"."+str(new_format)
     # secret = "mothing to see here"
     decrypt_wav_chebyshev_realtime(

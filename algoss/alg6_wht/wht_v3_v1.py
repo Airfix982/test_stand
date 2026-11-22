@@ -698,7 +698,9 @@ def build_cipher_meta_from_plain_meta(meta: Dict) -> Dict:
     }
 
 
-def test_6_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None):
+def test_6_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None, 
+    codec=None,
+    bitrate=None):
     samples_pcm, meta = read_wav_mono(org)
 
     encrypted_container = encrypt_signal(samples_pcm, meta)
@@ -707,7 +709,7 @@ def test_6_run(org, enc, dec, errored_enc=None, org_format=None, new_format=None
     write_wav_mono(enc, encrypted_container, cipher_meta)
 
     if org_format is not None and new_format is not None:
-        me.emulate_format_convertion(enc, org_format, new_format)
+        me.emulate_format_convertion(enc, org_format, new_format, codec, bitrate)
         # enc = enc+"."+str(new_format)
 
     enc_pcm_2, enc_meta = read_wav_mono(enc)

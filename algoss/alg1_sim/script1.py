@@ -2,7 +2,8 @@ import wave
 import math
 import numpy as np
 from numba import njit
-import script.utils as utils
+import algoss.script.utils as utils
+from algoss.script.codec_transport import codec_roundtrip_inplace
 import importlib
 
 
@@ -241,7 +242,9 @@ def test_1_run(
     r=0.9876543210987654,
     errored_enc=None,
     org_format=None,
-    new_format=None
+    new_format=None,
+    codec=None,
+    bitrate=None
 ):
     samples, meta = read_wav_mono(org)
 
@@ -254,9 +257,9 @@ def test_1_run(
         me.make_err(enc, errored_enc)
         enc = errored_enc
 
-
-    if org_format is not None and new_format is not None:
-        me.emulate_format_convertion(enc, org_format, new_format)
-        # enc = enc+"."+str(new_format)
+    codec_roundtrip_inplace(enc, new_format, bitrate)
+    # if org_format is not None and new_format is not None:
+    #     me.emulate_format_convertion(enc, org_format, new_format, codec, bitrate)
+    #     # enc = enc+"."+str(new_format)
 
     decrypt_wav_file_realtime_like(enc, dec, x0, r, block_samples)
