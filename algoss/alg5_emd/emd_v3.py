@@ -397,8 +397,8 @@ def decrypt_matrix_rows(mat, ks_mat, meta, itr, mode, emd_max_imfs, emd_max_sift
     return out
 
 
-def encrypt_chunk(chunk_samples, chunk_index, master_seed, meta, row_len, itr, mode, emd_max_imfs):
-    x0, y0, r1, r2 = derive_2dclm_params_from_chunk_index(chunk_index, master_seed)
+def encrypt_chunk(chunk_samples, chunk_index, master_seed, meta, row_len, itr, mode, emd_max_imfs, x0, y0, r1, r2):
+    # x0, y0, r1, r2 = derive_2dclm_params_from_chunk_index(chunk_index, master_seed)
     mantissa_bits_to_xor = 20
     perm = build_permutation(len(chunk_samples), chunk_index, master_seed)
     scrambled = apply_scrambling(chunk_samples, perm)
@@ -406,7 +406,8 @@ def encrypt_chunk(chunk_samples, chunk_index, master_seed, meta, row_len, itr, m
     padded, pad_len = pad_to_multiple(scrambled, row_len)
     mat = reshape_to_matrix(padded.astype(np.float64), row_len)
 
-    x, y = generate_2dclm(len(padded), x0, y0, r1, r2)
+    # x, y = generate_2dclm(len(padded), x0, y0, r1, r2)
+    x, y = generate_2dclm(len(padded), x0, y0, r1, r2, burn_in=0 if chunk_index==0 else 1)
 
     if mode == "xor":
         ks = build_keystream_u32(x, y)
@@ -435,15 +436,16 @@ def encrypt_chunk(chunk_samples, chunk_index, master_seed, meta, row_len, itr, m
 
 
 
-def decrypt_chunk(enc_chunk_samples, chunk_index, master_seed, meta, row_len, itr, mode, emd_max_imfs):
-    x0, y0, r1, r2 = derive_2dclm_params_from_chunk_index(chunk_index, master_seed)
+def decrypt_chunk(enc_chunk_samples, chunk_index, master_seed, meta, row_len, itr, mode, emd_max_imfs, x0, y0, r1, r2):
+    # x0, y0, r1, r2 = derive_2dclm_params_from_chunk_index(chunk_index, master_seed)
 
     perm = build_permutation(len(enc_chunk_samples), chunk_index, master_seed)
 
     padded, pad_len = pad_to_multiple(enc_chunk_samples, row_len)
     mat = reshape_to_matrix(padded.astype(np.float64), row_len)
 
-    x, y = generate_2dclm(len(padded), x0, y0, r1, r2)
+    # x, y = generate_2dclm(len(padded), x0, y0, r1, r2)
+    x, y = generate_2dclm(len(padded), x0, y0, r1, r2, burn_in=0 if chunk_index==0 else 1)
 
     if mode == "xor":
         ks = build_keystream_u32(x, y)
@@ -481,6 +483,11 @@ def split_into_chunks(samples, chunk_size):
     return [samples[i: i + chunk_size] for i in range(0, len(samples), chunk_size)]
 
 def encrypt_signal(samples, meta, chunk_size, row_len, itr, mode, emd_max_imfs, master_seed):
+
+    x0, y0, r1, r2 = derive_2dclm_params_from_chunk_index(0, master_seed)
+    x, y = generate_2dclm(1, x0, y0, r1, r2, burn_in=1000)
+    x0, y0 = float(x[0]), float(y[0])
+
     chunks = split_into_chunks(samples, chunk_size)
     enc_chunks = []
 
@@ -493,14 +500,26 @@ def encrypt_signal(samples, meta, chunk_size, row_len, itr, mode, emd_max_imfs, 
             row_len=row_len,
             itr=itr,
             mode=mode,
-            emd_max_imfs=emd_max_imfs
+            emd_max_imfs=emd_max_imfs,
+            x0=x0,
+            y0=y0,
+            r1=r1,
+            r2=r2
         )
         enc_chunks.append(enc_chunk)
+        length = len(chunk) + (-len(chunk)) % row_len
+        xx, yy = generate_2dclm(length,x0, y0, r1, r2,burn_in=0 if chunk_index == 0 else 1)
+        x0, y0 = float(xx[-1]), float(yy[-1])
 
     encrypted = np.concatenate(enc_chunks).astype(np.int64) if enc_chunks else np.array([], dtype=np.int64)
     return encrypted
 
 def decrypt_signal(samples, meta, chunk_size, row_len, itr, mode, emd_max_imfs, master_seed):
+
+    x0, y0, r1, r2 = derive_2dclm_params_from_chunk_index(0, master_seed)
+    x, y = generate_2dclm(1, x0, y0, r1, r2, burn_in=1000)
+    x0, y0 = float(x[0]), float(y[0])
+    
     chunks = split_into_chunks(samples, chunk_size)
     dec_chunks = []
 
@@ -513,9 +532,16 @@ def decrypt_signal(samples, meta, chunk_size, row_len, itr, mode, emd_max_imfs, 
             row_len=row_len,
             itr=itr,
             mode=mode,
-            emd_max_imfs=emd_max_imfs
+            emd_max_imfs=emd_max_imfs,
+            x0=x0,
+            y0=y0,
+            r1=r1,
+            r2=r2
         )
         dec_chunks.append(dec_chunk)
+        length = len(enc_chunk) + (-len(enc_chunk)) % row_len
+        xx, yy = generate_2dclm(length,x0, y0, r1, r2,burn_in=0 if chunk_index == 0 else 1)
+        x0, y0 = float(xx[-1]), float(yy[-1])
 
     decrypted = np.concatenate(dec_chunks).astype(np.int64) if dec_chunks else np.array([], dtype=np.int64)
     return decrypted
